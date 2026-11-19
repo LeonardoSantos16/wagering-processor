@@ -78,7 +78,22 @@ Ficaram fora do escopo, por decisão, para concentrar o prazo nas áreas que mai
 
 ## 5. Money
 
-<!-- Representação interna, validação de entrada, serialização, persistência. -->
+- **Decisão:** `bigint` em centavos no código e `numeric(20,2)` no banco, com entrada estrita de exatamente 2 casas decimais.
+- **Alternativas consideradas:**
+  - no código: biblioteca decimal (`decimal.js` / `big.js`);
+  - no banco: coluna `bigint` com o valor em centavos.
+- **Por que escolhi:**
+  - `bigint` é nativo, exato para qualquer tamanho e não se mistura com `number` por acidente. Como a entrada tem exatamente 2 casas e as operações são somas, subtrações e comparações, não há necessidade de controle de arredondamento, então uma dependência como `decimal.js` não se justifica.
+  - `numeric(20,2)` no banco é exato e mantém os valores legíveis em consultas, o que facilita auditoria e investigação de divergências. As constraints (`balance >= 0`) e a soma da reconciliação (`SUM`) também ficam exatas e claras.
+  - A entrada estrita segue o case ("sempre com escala fixa de 2 casas") e garante uma única representação para cada valor. Assim, o mesmo valor nunca gera `payloadHash` diferentes por estar escrito de formas diferentes (`"25"`, `"25.0"`, `"25.00"`).
+- **Regras de validação da entrada:** o formato aceito é apenas inteiro seguido de exatamente 2 casas decimais (ex.: `"25.00"`). São rejeitados: string vazia, notação científica (`"1e3"`), `NaN`, `Infinity`, sinal negativo, menos ou mais de 2 casas (`"25"`, `"25.5"`, `"25.001"`) e valores acima do máximo suportado.
+- **Negativos:** a entrada nunca aceita valores negativos, mas o `Money` pode representá-los internamente (`negate()`, `isNegative()`), por exemplo como resultado de uma subtração. Quem garante que o saldo nunca fica negativo é a `Wallet` (e o banco, via constraint), não o `Money`.
+- **Trade-offs / limitações:**
+  - Exige conversão string ↔ `bigint` nas fronteiras (API e banco), porque JSON não suporta `bigint` e o driver retorna `numeric` como string.
+  - A formatação para exibição é manual.
+  - Escala fixa de 2 casas para todas as moedas: moedas com outra escala (ex.: JPY com 0, BHD com 3) não são suportadas. O case permite assumir uma única moeda (BRL); o modelo continua multimoeda e conflitos de moeda são rejeitados.
+  - O `bigint` não tem limite, mas o `numeric(20,2)` tem. Por isso o `Money` valida um valor máximo, para que um valor grande demais seja rejeitado no domínio e não estoure no banco.
+  - Se surgirem percentuais, juros ou rateio, será preciso implementar o arredondamento ou rever a decisão.
 
 ## 6. Modelo de domínio
 
@@ -105,7 +120,9 @@ Ficaram fora do escopo, por decisão, para concentrar o prazo nas áreas que mai
 
 **Observação sobre migrations:** a migration gerada com `--initial` não inclui `down`; as geradas a partir de diferenças no schema incluem. Como o case exige migrations reversíveis, todo `down` é conferido.
 
-<!-- Mapeamento do Money e estratégia transacional: a definir. -->
+**Mapeamento do Money:** ver seção 5 (`numeric(20,2)` + coluna de moeda, convertido de/para `bigint` na reidratação).
+
+<!-- Estratégia transacional: a definir. -->
 
 ## 8. Schema, constraints e índices
 
@@ -140,9 +157,11 @@ Ficaram fora do escopo, por decisão, para concentrar o prazo nas áreas que mai
 - **Decisão:** `pino` via `nestjs-pino`, com saída em JSON.
 - **Alternativas consideradas:** `winston`; estender o logger nativo do NestJS para gerar JSON.
 - **Por que escolhi:** JSON nativo; o `nestjs-pino` propaga o contexto da requisição (via `AsyncLocalStorage`) para todos os logs gerados durante ela, sem passar o logger manualmente.
+- **Trade-offs / limitações:** a saída em JSON é pouco legível no terminal durante o desenvolvimento (pode ser contornado com `pino-pretty`, não incluído).
 
 **Como está configurado:**
 - **`correlationId`:** reutiliza o header `x-correlation-id` da requisição, ou gera um UUID. É devolvido no mesmo header da resposta e aparece em todos os logs da requisição.
+- **Sem dados sensíveis:** o log da requisição registra só método e URL, e o da resposta só o status. Headers `authorization` e `cookie` são removidos (`redact`), e corpos de requisição e resposta (payloads financeiros) não são logados.
 - Requisições aos health checks não geram log de acesso, para não poluir os logs com as sondagens.
 
 <!-- messageId, transactionId, walletId, providerId: a adicionar com o use case e o consumidor SQS. -->
