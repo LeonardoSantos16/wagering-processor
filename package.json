@@ -38,7 +38,7 @@
   },
   "mikro-orm": {
     "configPaths": [
-      "./src/mikro-orm.config.ts"
+      "./src/infrastructure/persistence/mikro-orm.config.ts"
     ]
   }
 }

@@ -4,12 +4,12 @@ import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { LoggerModule } from 'nestjs-pino';
-import ormConfig from './mikro-orm.config';
-import { ConfigModule } from './config/config.module';
-import { loadConfig } from './config/app-config';
-import { SqsModule } from './messaging/sqs.module';
-import { HealthModule } from './health/health.module';
-import { AuthGuard } from './auth/auth.guard';
+import ormConfig from './infrastructure/persistence/mikro-orm.config';
+import { ConfigModule } from './infrastructure/config/config.module';
+import { loadConfig } from './infrastructure/config/app-config';
+import { SqsModule } from './infrastructure/messaging/sqs.module';
+import { HealthModule } from './infrastructure/http/health/health.module';
+import { AuthGuard } from './infrastructure/http/auth/auth.guard';
 
 const CORRELATION_HEADER = 'x-correlation-id';
 
