@@ -12,6 +12,10 @@ coverage/
 # Logs
 *.log
 
+# Claude Code (arquivos pessoais)
+CLAUDE.local.md
+.claude/settings.local.json
+
 # IDE / SO
 .vscode/
 .idea/
