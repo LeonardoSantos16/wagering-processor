@@ -1,7 +1,7 @@
 import { Controller, Get, Inject, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { GetQueueUrlCommand, SQSClient } from '@aws-sdk/client-sqs';
-import { APP_CONFIG, type AppConfig } from '../config/app-config';
+import { APP_CONFIG, type AppConfig } from '../../config/app-config';
 import { Public } from '../auth/public.decorator';
 
 type CheckStatus = 'up' | 'down';

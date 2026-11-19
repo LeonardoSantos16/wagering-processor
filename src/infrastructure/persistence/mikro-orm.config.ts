@@ -1,6 +1,6 @@
 import { defineConfig } from '@mikro-orm/postgresql';
 import { Migrator } from '@mikro-orm/migrations';
-import { loadConfig } from './config/app-config';
+import { loadConfig } from '../config/app-config';
 
 const { db } = loadConfig();
 
@@ -14,7 +14,7 @@ export default defineConfig({
   discovery: { warnWhenNoEntities: false },
   extensions: [Migrator],
   migrations: {
-    path: 'src/migrations',
+    path: 'src/infrastructure/persistence/migrations',
     glob: '!(*.d).ts',
     transactional: true,
   },
