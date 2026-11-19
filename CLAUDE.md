@@ -53,4 +53,15 @@ Falhas eliminatórias adicionais: saldo negativo por race, débito/crédito dupl
 
 ## Comandos
 
-<!-- Preencher após o setup da etapa 1: subir ambiente, migrations, testes por tipo. -->
+| Comando | O que faz |
+|---|---|
+| `bun install` | Instala dependências |
+| `bun run infra:up` | Sobe PostgreSQL + LocalStack (4.14.0, fixo: última versão sem token) e espera ficarem saudáveis |
+| `bun run infra:down` | Derruba a infraestrutura e apaga os volumes |
+| `bun run dev` / `bun run start` | Sobe a API (porta 3000) com/sem watch |
+| `bun run db:migrate` / `db:migrate:down` | Aplica / reverte migrations |
+| `bun run db:migration:create` | Gera migration a partir das mudanças no schema (conferir sempre o `down`) |
+| `bun run typecheck` | Typecheck em modo estrito |
+| `bun test` | Roda os testes (os de integração exigem `infra:up`) |
+
+Configuração por variáveis de ambiente (ver `.env.example`); os padrões já apontam para o ambiente local.
