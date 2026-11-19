@@ -1,0 +1,44 @@
+{
+  "name": "wagering-processor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "dev": "bun --watch run src/main.ts",
+    "infra:up": "docker compose up -d --wait",
+    "infra:down": "docker compose down -v",
+    "db:migrate": "bun --bun mikro-orm migration:up",
+    "db:migrate:down": "bun --bun mikro-orm migration:down",
+    "db:migration:create": "bun --bun mikro-orm migration:create",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1172.0",
+    "@mikro-orm/core": "^7.2.10",
+    "@mikro-orm/migrations": "^7.2.10",
+    "@mikro-orm/nestjs": "^7.1.0",
+    "@mikro-orm/postgresql": "^7.2.10",
+    "@nestjs/common": "^12.5.1",
+    "@nestjs/core": "^12.5.1",
+    "@nestjs/platform-express": "^12.5.1",
+    "nestjs-pino": "^5.3.2",
+    "pino": "^10.4.0",
+    "pino-http": "^11.0.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2"
+  },
+  "devDependencies": {
+    "@mikro-orm/cli": "^7.2.10",
+    "@nestjs/testing": "^12.5.1",
+    "@types/bun": "^1.4.4",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  },
+  "mikro-orm": {
+    "configPaths": [
+      "./src/mikro-orm.config.ts"
+    ]
+  }
+}
