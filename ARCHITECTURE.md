@@ -48,7 +48,30 @@ Antes de qualquer código de domínio, um spike validou que a stack funciona jun
 
 ## 2. Estrutura do código e boundaries
 
-<!-- Camadas (domínio, aplicação, infraestrutura, interfaces), portas e adapters. -->
+- **Decisão:** DDD tático com portas e adaptadores (arquitetura hexagonal), organizado **por camada**.
+- **Alternativas consideradas:**
+  - CQRS formal (comandos, queries e handlers separados, `@nestjs/cqrs`);
+  - versão mais leve, com use cases usando o `EntityManager` diretamente, sem interfaces de repositório;
+  - organização por módulo (`wallet/`, `wagering/`), com camadas dentro de cada um.
+- **Por que escolhi:** o case pede os padrões táticos do DDD (value object `Money`, aggregate root `Wallet`, entidades com transições explícitas, factories e `rehydrate`) e avalia "boundaries, portas e simplicidade". Portas e adaptadores mantêm o domínio isolado de NestJS e MikroORM sem acrescentar camadas que nenhuma regra exige, como o CQRS formal. DDD estratégico (bounded contexts, mapas de contexto) não se justifica em um sistema deste tamanho. A organização por camada foi preferida porque o use case central altera wallet, transação, ledger e outbox na mesma transação SQL: separar em módulos geraria imports cruzados constantes, sem uma fronteira real entre eles.
+- **Trade-offs / limitações:** se o sistema crescesse para vários contextos independentes, a organização por módulo passaria a fazer mais sentido.
+
+```
+src/
+  domain/          regras de negócio puras: Money, Wallet, WagerTransaction,
+                   WalletLedgerEntry, Inbox/Outbox, eventos de integração, erros de domínio
+  application/     use cases (orquestram uma transação SQL) e portas
+                   (interfaces de repositórios, publisher, relógio etc.)
+  infrastructure/  adaptadores: persistence (MikroORM), messaging (SQS),
+                   http (controllers, health, auth), config
+  main.ts, app.module.ts
+```
+
+**Regra de dependência:** `infrastructure → application → domain`. O domínio não importa nada de fora dele, nem `@nestjs/*`, nem `@mikro-orm/*`. A regra é verificada por um teste automático (`test/architecture.test.ts`), que falha se algum arquivo de `src/domain/` importar esses pacotes ou as outras camadas.
+
+**Erros de domínio:** uma classe base abstrata `DomainError` carrega um `code: FailureCode` (seção 11.2), com uma subclasse por situação (ex.: `InvalidMoneyError` → `INVALID_MONEY`). A camada HTTP converte qualquer `DomainError` em resposta pelo `code`, sem conhecer cada erro. O `InvalidTransactionStateError` fica **fora** dessa hierarquia: é erro de programação, não regra de negócio, e resulta em 500.
+
+**Testes:** os de unidade ficam ao lado do código (`*.test.ts` em `src/`); os de integração, concorrência e e2e, que precisam de infraestrutura rodando, ficam em `test/`.
 
 ## 3. Escopo e decisões de fora do escopo
 
