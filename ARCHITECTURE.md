@@ -606,7 +606,35 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 
 ## 17. Testes
 
-<!-- Estratégia, como cada cenário obrigatório é exercitado, determinismo. -->
+<!-- Estratégia geral, cenários de mensageria e multi-instância (etapas 6 a 8). -->
+
+### 17.1 Concorrência do núcleo
+
+- **Decisão:** os cenários rodam em duas camadas. No use case (`test/application/process-wager-transaction.concurrency.test.ts`), as chamadas são disparadas com `Promise.all`. Por HTTP (`test/http/wagering-transactions.concurrency.e2e.test.ts`), o `AppModule` sobe e recebe `fetch` em paralelo, cobrindo o 50× e o 80/80. O paralelismo é real no PostgreSQL: até 10 conexões do pool disputam o `FOR UPDATE` ao mesmo tempo. A execução com várias instâncias fica para a etapa 8.
+- **Alternativas consideradas:** só o use case (mais rápido, sem cobrir o mapeamento HTTP sob corrida); só HTTP (mais lento, com o Express no caminho de todos os cenários).
+- **Por que escolhi:** o use case isola o núcleo (lock e idempotência) e permite cenários mais finos, como o lock retido numa wallet. O HTTP confirma que, sob corrida, o provedor recebe os status e corpos certos: 49 replays idênticos ao original, e 201/422 no 80/80.
+- **Cenários:**
+
+  | Cenário | O que é verificado |
+  |---|---|
+  | mesma `BET` 50× em paralelo | 1 original + 49 replays com o mesmo id e saldo; 1 débito; 2 eventos no outbox |
+  | saldo 100, duas `BET` de 80 | 1 `PROCESSED` + 1 `REJECTED` (`INSUFFICIENT_FUNDS`), saldo 20, 1 débito |
+  | saldo 100, 30 `BET` de 10 | exatamente 10 processadas, `balanceAfter` de 90 a 0 sem repetição, nunca negativo |
+  | `BET` e `WIN` intercalados | saldo final igual à soma esperada |
+  | 10 wallets × 5 `BET` | cada wallet consistente |
+  | lock retido na wallet A | uma transação na wallet B termina enquanto a da A espera (restrição 6) |
+
+  Todos terminam com a invariante `wallet.balance == saldo reconstruído pelo ledger`.
+- **Limite de espera:** o 50× exige 50 sucessos, sem 503, usando o `lock_timeout` de produção (2 s). Com o pool de 10 conexões, uma requisição espera no máximo as nove à frente no lock; as demais aguardam no pool, que não conta para o `lock_timeout`.
+- **Prova de que os testes detectam o erro:** sem o `FOR UPDATE`, cinco dos seis cenários do use case falham. O 50× continua passando: sem o lock, a corrida pela mesma key é barrada pelo `wager_transaction_provider_idempotency_key_unique` e pela nova execução (seção 9.5). São duas proteções independentes para o duplo débito.
+
+### 17.2 Atomicidade entre wallet, ledger e outbox
+
+- **Decisão:** um `UnitOfWork` de teste (`FailingOnOutboxUnitOfWork`) envolve o real e falha na primeira gravação no outbox. Antes de falhar, ele consulta o ledger. A consulta faz o MikroORM executar o `flush` dos inserts e updates pendentes, e o teste confirma que o lançamento novo já estava visível dentro da transação. Só depois o erro é lançado. Assim o teste prova um rollback de linhas realmente escritas, e não só que nada chegou a ser enviado ao banco.
+- **Alternativas consideradas:** uma falha no próprio banco (trigger temporário barrando o insert no `outbox_message`), que exige DDL no teste e limpeza depois.
+- **Por que escolhi:** banco real, sem DDL no teste. A falha fica num ponto controlado, depois que transação, wallet e ledger foram gravados.
+- **Cenários:** depois da falha, nenhuma transação nem lançamento novo, saldo e `version` intactos, outbox inalterado. A mesma requisição reenviada é processada normalmente, porque não ficou registro parcial. A abertura de wallet que falha não deixa wallet, transação `OPENING`, lançamento nem evento.
+- **Trade-offs / limitações:** o inbox entra nesse teste na etapa 6, quando o consumidor passar a gravá-lo na mesma transação.
 
 ## 18. Trade-offs e limitações conhecidas
 
