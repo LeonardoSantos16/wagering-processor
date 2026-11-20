@@ -1,6 +1,8 @@
 import type { EntityManager } from '@mikro-orm/postgresql';
 import type { WagerTransactionRepository } from '../../../application/ports/wager-transaction.repository';
 import type { WagerTransaction } from '../../../domain/wagering/wager-transaction';
+import { WagerTransactionKind } from '../../../domain/wagering/wager-transaction-kind';
+import { WagerTransactionStatus } from '../../../domain/wagering/wager-transaction-status';
 import { WagerTransactionRecord } from './wager-transaction.entity';
 import { WagerTransactionMapper } from './wager-transaction.mapper';
 
@@ -20,6 +22,15 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
     externalTransactionId: string,
   ): Promise<WagerTransaction | null> {
     return this.findOne({ providerId, externalTransactionId });
+  }
+
+  async findProcessedReversalOf(referenceTransactionId: string): Promise<WagerTransaction | null> {
+    const record = await this.em.findOne(WagerTransactionRecord, {
+      referenceTransactionId,
+      kind: { $in: [WagerTransactionKind.Refund, WagerTransactionKind.Rollback] },
+      status: WagerTransactionStatus.Processed,
+    });
+    return record ? WagerTransactionMapper.toDomain(record) : null;
   }
 
   async save(transaction: WagerTransaction): Promise<void> {

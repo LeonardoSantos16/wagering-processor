@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Module } from '@nestjs/common';
-import { APP_GUARD } from '@nestjs/core';
+import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { LoggerModule } from 'nestjs-pino';
 import ormConfig from './infrastructure/persistence/mikro-orm.config';
@@ -10,6 +10,10 @@ import { loadConfig } from './infrastructure/config/app-config';
 import { SqsModule } from './infrastructure/messaging/sqs.module';
 import { HealthModule } from './infrastructure/http/health/health.module';
 import { AuthGuard } from './infrastructure/http/auth/auth.guard';
+import { GlobalExceptionFilter } from './infrastructure/http/errors/global-exception.filter';
+import { WageringModule } from './infrastructure/http/wagering/wagering.module';
+import { WalletsModule } from './infrastructure/http/wallets/wallets.module';
+import { PersistenceModule } from './infrastructure/persistence/persistence.module';
 
 const CORRELATION_HEADER = 'x-correlation-id';
 
@@ -27,7 +31,6 @@ const CORRELATION_HEADER = 'x-correlation-id';
           return correlationId;
         },
         customProps: (req: IncomingMessage) => ({ correlationId: req.id }),
-        // Never log credentials or full request/response bodies.
         redact: ['req.headers.authorization', 'req.headers.cookie'],
         serializers: {
           req: (req: { method: string; url: string }) => ({ method: req.method, url: req.url }),
@@ -39,9 +42,15 @@ const CORRELATION_HEADER = 'x-correlation-id';
       },
     }),
     MikroOrmModule.forRoot(ormConfig),
+    PersistenceModule,
     SqsModule,
     HealthModule,
+    WalletsModule,
+    WageringModule,
   ],
-  providers: [{ provide: APP_GUARD, useClass: AuthGuard }],
+  providers: [
+    { provide: APP_GUARD, useClass: AuthGuard },
+    { provide: APP_FILTER, useClass: GlobalExceptionFilter },
+  ],
 })
 export class AppModule {}

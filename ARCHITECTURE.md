@@ -179,6 +179,15 @@ stateDiagram-v2
 - **Referência que não está `PROCESSED`.** A regra 3 exige que a referência seja `PROCESSED`. Se ela existe em qualquer outro estado (`REJECTED`, `FAILED` ou `PENDING_REFERENCE`), a nova transação é rejeitada com `REFERENCE_NOT_PROCESSED`, sem espera. Ver limitação na seção 18.
 - **Reversão única no total.** A regra 4 diz que uma referência não pode ser revertida duas vezes "pelo mesmo tipo de operação". Lida literalmente, uma `BET` poderia receber um `REFUND` e um `ROLLBACK`, creditando o valor duas vezes, o que viola a invariante global de não duplicar créditos. Por isso, uma transação só pode ser revertida **uma vez no total**, por `REFUND` ou `ROLLBACK`; a segunda tentativa é rejeitada com `ALREADY_REVERSED`. Um `ROLLBACK` de um `REFUND` continua permitido, porque reverte outra transação. No banco, a unicidade é garantida por um índice único sobre a referência (não sobre referência + tipo) entre as reversões processadas.
 
+- **Ordem das verificações.** Quando mais de uma regra se aplica, vale a primeira desta lista:
+  1. `CURRENCY_MISMATCH`, depois `PLAYER_WALLET_MISMATCH` (`WagerTransaction.checkWallet`). A moeda vem primeiro porque `CURRENCY_MISMATCH` é o único código gravado sem saldo: o saldo da wallet está em outra moeda, e a linha tem uma única coluna de moeda. Uma transação com moeda e player divergentes não poderia ser gravada como `PLAYER_WALLET_MISMATCH`.
+  2. Referência informada e não encontrada → `PENDING_REFERENCE`. As regras da wallet vêm antes para não deixar pendente uma transação que nunca vai poder passar.
+  3. `REFERENCE_MISMATCH` → `INVALID_REFERENCE_KIND` → `REFERENCE_NOT_PROCESSED` → `AMOUNT_MISMATCH` (`WagerTransaction.checkReference`).
+  4. `ALREADY_REVERSED`, só para `REFUND` e `ROLLBACK`.
+  5. Saldo: `INSUFFICIENT_FUNDS` para `BET`; `REVERSAL_INSUFFICIENT_FUNDS` para um `ROLLBACK` que vira débito (regra 9).
+- **`LOSS` grava o saldo atual.** Um `LOSS` é `PROCESSED` sem movimento e sem lançamento, e o `balance_after` registra o saldo observado naquele momento, para que o replay devolva o mesmo saldo (regra 7).
+- **`WIN` com referência.** Um `WIN` pode referenciar a `BET` da rodada. A referência passa pelas mesmas validações de contexto, tipo e status, mas sem a exigência de valor igual (o prêmio não é o valor apostado), e o `WIN` não é uma reversão: a `BET` continua podendo receber um `REFUND`. Um `BET` ou `LOSS` com referência é rejeitado com `INVALID_REFERENCE_KIND`.
+
 ## 7. ORM e mapeamento de persistência
 
 ### 7.1 Escolha do ORM
@@ -206,7 +215,7 @@ stateDiagram-v2
 - **Trade-offs:**
   - Cada agregado tem duas definições (domínio e persistência) mais um mapper.
   - Uma mudança em campo persistido exige ajustar o mapper.
-  - A `version` da `Wallet` é incrementada pelo domínio e persistida como uma coluna comum, sem `version: true`, para não ser incrementada duas vezes. Como ela participa do controle de concorrência é decidido na etapa 4 (seção 9).
+  - A `version` da `Wallet` é incrementada pelo domínio e persistida como uma coluna comum, sem `version: true`, para não ser incrementada duas vezes. Ela não participa do controle de concorrência (seção 9.6).
 
 **Observação do spike:** uma classe com construtor `private` e sem decorators pode ser mapeada via `EntitySchema`. Em runtime funciona (o ORM reidrata sem chamar o construtor), mas o TypeScript recusa o construtor privado no `EntitySchema`, o que exige um cast (`as unknown as EntityCtor<T>`) em cada entidade. Esse foi um dos motivos para usar modelos separados.
 
@@ -214,7 +223,14 @@ stateDiagram-v2
 
 **Mapeamento do Money:** ver seção 5. A coluna `numeric(20,2)` é lida como string decimal (`"75.00"`) e convertida por `Money.from`; na escrita, o mapper usa `money.toJSON().amount`. Não há `number` em nenhum ponto do caminho.
 
-<!-- Estratégia transacional: a definir. -->
+**Transação do caso de uso:** ver seção 9.2 (`UnitOfWork`).
+
+### 7.3 Identificadores e relógio
+
+- **Decisão:** ids gerados como UUIDv7 (`Bun.randomUUIDv7()`), por meio de dois ports da camada de aplicação: `IdGenerator` e `Clock`. O domínio continua recebendo `id` e `now` de fora.
+- **Alternativas consideradas:** UUIDv4 (`randomUUID()`), gerado direto onde é usado.
+- **Por que escolhi:** os exemplos do case são UUIDv7. Por serem ordenados por tempo, deixam os índices das chaves primárias mais compactos que ids aleatórios e servem de desempate mais natural. Os ports permitem que os testes fixem a data.
+- **Trade-offs / limitações:** o id revela aproximadamente quando foi criado.
 
 ## 8. Schema, constraints e índices
 
@@ -326,13 +342,124 @@ A migration gerada com `--initial` não inclui `down`, por isso não é usada: t
 
 ## 9. Concorrência
 
+### 9.1 Estratégia por wallet
+
+- **Decisão:** lock pessimista na linha da wallet (`SELECT … FOR UPDATE`, método `WalletRepository.findByIdForUpdate`), adquirido no início de toda transação que pode alterar o saldo. Com o lock, o domínio calcula o novo saldo (`Wallet.debit`/`credit`) e o `UPDATE` grava. O `CHECK (balance >= 0)` do schema é a última barreira.
+- **Alternativas consideradas:**
+  - lock otimista com retry limitado (`UPDATE … WHERE version = :lida`);
+  - update atômico condicionado (`UPDATE … SET balance = balance - :x WHERE balance >= :x`);
+  - combinações das anteriores.
+- **Por que escolhi:**
+  - Wallet de aposta é disputada: o mesmo jogador envia `BET`/`WIN` em sequência rápida, e a fila reprocessa mensagens. Com lock otimista, isso viraria uma sequência de conflitos e de 503 quando as tentativas acabassem; com o lock, as requisições esperam em fila e nenhuma precisa ser refeita.
+  - A regra de saldo continua no domínio, testada na etapa 2. No update atômico ela iria para o SQL, e as outras validações (referência, reversão) ainda precisariam de uma leitura consistente.
+  - O mesmo lock serializa os outros conflitos da mesma wallet: duas requisições com a mesma idempotency key e duas reversões da mesma referência (que, quando válida, está sempre na mesma wallet, regra 2). A segunda sempre encontra a primeira já gravada.
+  - Funciona com várias instâncias, porque o lock fica no PostgreSQL. É um lock por linha, não global (restrição 6): wallets diferentes não esperam umas pelas outras.
+- **Trade-offs / limitações:** numa wallet muito disputada a latência cresce com a fila, e cada requisição em espera ocupa uma conexão do pool. A espera tem limite (seção 9.3).
+
+### 9.2 Fronteira da transação
+
+- **Decisão:** port `UnitOfWork` na camada de aplicação, com `run(work: (repositories) => Promise<T>)`. A implementação (`MikroOrmUnitOfWork`) abre um `EntityManager` próprio, inicia a transação com `em.transactional()` e entrega os cinco repositórios ligados a ela. O `flush` e o commit acontecem no fim do `run`; um erro dentro dele desfaz tudo.
+- **Alternativas consideradas:** decorator `@Transactional()` do MikroORM, com os repositórios resolvidos por contexto (`AsyncLocalStorage`); `em.transactional()` chamado direto no use case.
+- **Por que escolhi:** a camada de aplicação continua sem nenhum import do ORM (verificado pelo teste de arquitetura). Os repositórios chegam por parâmetro, então não há como usar um repositório fora da transação por engano. A atomicidade fica fácil de testar: o que o `work` grava só aparece se ele terminar sem erro.
+- **Trade-offs / limitações:** os repositórios são criados a cada transação (objetos leves, sem estado além do `EntityManager`).
+
+### 9.3 Isolamento e espera pelo lock
+
+- **Decisão:** `READ COMMITTED`, declarado explicitamente, e `SET LOCAL lock_timeout` no início de cada transação, com valor configurável (`WALLET_LOCK_TIMEOUT_MS`, padrão 2000 ms). Estourar o tempo (`55P03`), deadlock (`40P01`) e falha de serialização (`40001`) viram `TEMPORARILY_UNAVAILABLE` (503): nada é gravado e o reenvio com a mesma key é seguro.
+- **Alternativas consideradas:** `REPEATABLE READ` ou `SERIALIZABLE`; espera sem limite; um limite maior.
+- **Por que escolhi:**
+  - Em `READ COMMITTED`, quando a segunda transação consegue o lock, o `FOR UPDATE` devolve a linha já atualizada pela primeira, e as leituras seguintes (idempotência, referência) também enxergam o que a primeira gravou. Nos níveis mais altos, o Postgres abortaria a segunda com `40001`, e seria preciso refazê-la, que é exatamente o que o lock pessimista evita.
+  - Um limite curto devolve o controle ao provedor cedo, com um código que diz para reenviar com backoff, em vez de segurar conexões do pool.
+- **Trade-offs / limitações:** numa wallet extremamente disputada, parte das requisições recebe 503 e precisa ser reenviada. O deadlock não deveria ocorrer, porque cada transação trava uma única wallet; a tradução existe por segurança e não tem teste que a provoque.
+
+### 9.4 Ordem dos passos no processamento de uma transação
+
+1. Fora da transação: validar o payload (400) e montar a transação candidata, que calcula o `payloadHash` (seção 10.1).
+2. `BEGIN` + `SET LOCAL lock_timeout`.
+3. Travar a wallet. Se não existir, `WALLET_NOT_FOUND` (seção 6.2).
+4. Buscar pela idempotency key: mesmo hash → replay; hash diferente → `IDEMPOTENCY_CONFLICT` (seção 10.2).
+5. Buscar pelo `(providerId, externalTransactionId)`: se existir, `EXTERNAL_TRANSACTION_CONFLICT`.
+6. Regras de negócio, na ordem da seção 6.2, resultando em `PROCESSED`, `REJECTED` ou `PENDING_REFERENCE`.
+7. Gravar transação, wallet, ledger e outbox, e `COMMIT`.
+
+A idempotência é verificada **depois** do lock, para que duas requisições com a mesma key na mesma wallet sejam serializadas e a segunda veja a primeira já commitada. O custo é que um replay também espera na fila da wallet. A alternativa, ler a idempotência antes do lock como caminho rápido e repetir a leitura depois dele, foi descartada por exigir duas leituras e mais código.
+
+### 9.5 Corridas que o lock da wallet não cobre
+
+- **Decisão:** violações de `UNIQUE` são traduzidas pelo **nome** da constraint, na saída do `UnitOfWork`:
+
+  | Constraint | Resultado |
+  |---|---|
+  | `wallet_player_currency_unique` | `WALLET_ALREADY_EXISTS` (409) |
+  | `wager_transaction_provider_external_id_unique` | `EXTERNAL_TRANSACTION_CONFLICT` (409) |
+  | `wager_transaction_provider_idempotency_key_unique` | o use case roda mais uma vez, numa transação nova |
+  | qualquer outra | sem tradução (500) |
+
+- **Alternativas consideradas:** consultar antes de inserir (não resolve a corrida); traduzir pela mensagem de erro.
+- **Por que escolhi:** essas corridas acontecem entre requisições que não disputam a mesma wallet: duas criações de wallet para o mesmo jogador, ou a mesma key/id externo enviados para wallets diferentes. Depois da violação o Postgres aborta a transação, então a linha vencedora só pode ser lida numa transação nova. Na nova execução, o passo 4 encontra essa linha e decide entre replay e conflito com a mesma lógica de sempre, limitado a uma nova execução. O nome da constraint é estável e explícito (seção 8.1); a mensagem não é.
+- **Trade-offs / limitações:** a violação de `wager_transaction_single_reversal_unique` fica sem tradução: com o lock da wallet, duas reversões da mesma referência nunca concorrem, então ela só ocorreria por bug, e o índice é a rede de segurança.
+
+### 9.6 Papel da `version` e ordem do ledger
+
+- **Decisão:** a `version` da wallet é só um contador (começa em 1 e aumenta a cada movimento, como o case exige), sem participar do controle de concorrência. O ledger não ganha uma coluna de versão.
+- **Alternativas consideradas:**
+  - usar a `version` como checagem extra no `UPDATE` (`WHERE version = :lida`), uma segunda proteção caso algum caminho esqueça o lock;
+  - gravar a `version` em cada lançamento (`wallet_version`) com `UNIQUE (wallet_id, wallet_version)`, dando ao histórico uma ordem exata e uma garantia a mais no schema.
+- **Por que escolhi:** uma única garantia, o lock, exercitada pelos testes de concorrência. O case sugere a `version` para lock otimista, mas aceita outra estratégia se justificada (seção 9.1). Nenhum requisito pede ordem exata do ledger: a reconciliação e a invariante saldo × ledger somam créditos e débitos, e o cursor do histórico já é estável com `(created_at, id)`.
+- **Trade-offs / limitações:** ver seção 18 (ordem do histórico depende do relógio das instâncias).
+
 ## 10. Idempotência
 
-<!-- Fluxo, replay, conflito, algoritmo do payloadHash. -->
+### 10.1 Algoritmo do `payloadHash`
+
+- **Decisão:** SHA-256 em hexadecimal sobre um JSON canônico (chaves em ordem alfabética em todos os níveis, sem espaços, campos `undefined` omitidos) dos campos de negócio: `providerId`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money` (`amount` e `currency`, como strings) e `referenceExternalTransactionId`, quando presente. O header `Idempotency-Key` e os metadados de transporte ficam de fora. É calculado pelo domínio (`computePayloadHash`, chamado em `WagerTransaction.create`).
+- **Alternativas consideradas:** hash do corpo bruto da requisição; incluir a idempotency key no hash.
+- **Por que escolhi:** o corpo bruto muda com a ordem das chaves e os espaços, sem mudar a operação. Como o `amount` só aceita exatamente 2 casas (seção 5), o mesmo valor nunca aparece escrito de formas diferentes. A key já é o critério de busca, então incluí-la no hash não acrescentaria nada.
+- **Trade-offs / limitações:** um campo de negócio novo no payload precisa entrar no hash; transações antigas continuam comparadas pelo hash antigo, e uma repetição delas com o campo novo seria vista como conflito.
+
+### 10.2 Replay e conflito
+
+- **Decisão:**
+  - A `Idempotency-Key` é obrigatória, não vazia e com até 255 caracteres, sem formato imposto. O case recomenda `"{providerId}:{externalTransactionId}"`, mas diz que o header é a fonte da verdade.
+  - A unicidade é por `(providerId, idempotencyKey)`, garantida no schema.
+  - Mesma key e mesmo hash → replay: devolve a transação gravada, com `idempotentReplay: true` e **o mesmo status HTTP** da resposta original.
+  - Mesma key e hash diferente → `IDEMPOTENCY_CONFLICT` (409), nunca replay.
+  - A resposta do replay é reconstruída a partir da linha gravada (`id`, `status`, `balance_after`, `failure_code`). O `balance_after` é o saldo observado no momento do processamento, o que cumpre a regra 7 mesmo que a wallet tenha mudado depois.
+- **Alternativas consideradas:** responder o replay sempre com 200; gravar um snapshot do corpo da resposta (`response jsonb`).
+- **Por que escolhi:** com o mesmo status, o provedor decide o que fazer do mesmo jeito na primeira resposta e na repetição, sem ler o corpo. Reconstruir pela linha evita uma coluna nova, que poderia divergir da própria linha e congelaria o formato da resposta no banco.
+- **Trade-offs / limitações:** uma mudança futura no formato da resposta também vale para replays de transações antigas.
 
 ## 11. API HTTP
 
 ### 11.1 Mapeamento de status HTTP
+
+**`POST /wagering/transactions`:** o status depende do resultado gravado.
+
+| Resultado | HTTP |
+|---|---|
+| `PROCESSED` | 201 |
+| `PENDING_REFERENCE` | 202 |
+| `REJECTED` | 422 |
+| Replay | o status do resultado original, com `idempotentReplay: true` |
+
+**`POST /wallets`:** 201 na criação.
+
+**Erros sem gravação:** o status vem da categoria do `failureCode` (seção 11.2): 400 para payload inválido, 409 para conflito, 422 para `WALLET_NOT_FOUND` citada no corpo (404 quando o recurso é o da URL), 503 para falha transitória e 500 para erro inesperado.
+
+**Formatos de corpo:**
+- **Resultado gravado** (201, 202 e 422 de rejeição): `{ transactionId, status, balance, failureCode?, idempotentReplay }`. Uma rejeição é uma transação real, com id, que o provedor pode consultar depois. O `balance` é o `balance_after` gravado, ou `null` quando não há saldo (`PENDING_REFERENCE` e `CURRENCY_MISMATCH`).
+- **Erro sem gravação:** `{ failureCode, message, details? }`, montado por um filtro global de exceções. Em payload inválido, `details` lista os campos com erro (`[{ path, message }]`).
+
+**Validação de entrada:**
+- **Decisão:** schemas zod na camada HTTP, aplicados por um pipe próprio (`ZodValidationPipe`). O schema garante a forma do payload; o formato do valor monetário continua sendo validado pelo `Money.from` (`INVALID_MONEY`).
+- **Alternativas consideradas:** `class-validator` + `class-transformer` (padrão da documentação do NestJS); validação manual.
+- **Por que escolhi:** o schema é TypeScript puro e gera o tipo do comando, e o mesmo schema poderá validar as mensagens do consumidor SQS, que não passa pelos pipes do NestJS.
+- **Trade-offs / limitações:** uma dependência a mais. O pipe roda antes do handler, então uma requisição com corpo inválido e sem `Idempotency-Key` recebe `INVALID_PAYLOAD`, não `MISSING_IDEMPOTENCY_KEY` (as duas são 400).
+
+**Detalhes da validação:**
+- `walletId` é validado como UUID: um valor qualquer chegaria à coluna `uuid` e o banco recusaria a consulta com erro de sintaxe, respondendo 500.
+- `kind` é aceito como string pelo schema e convertido no controller: um valor fora do enum, ou `OPENING`, responde `INVALID_KIND` (e não `INVALID_PAYLOAD`), como a taxonomia exige.
+- JSON malformado responde 400 `INVALID_PAYLOAD`. Outros erros HTTP do framework (por exemplo, rota inexistente) saem com o status deles e só `message`, sem `failureCode`, porque nenhum código da taxonomia corresponde a eles.
 
 ### 11.2 Taxonomia de `failureCode`
 
@@ -444,6 +571,11 @@ A migration gerada com `--initial` não inclui `down`, por isso não é usada: t
 
 ## 14. Referências fora de ordem (`PENDING_REFERENCE`)
 
+- **Primeira tentativa:** uma transação cuja referência não existe é gravada em `PENDING_REFERENCE`, sem saldo e sem tocar a wallet, com o evento `WagerTransactionPendingReference`. A primeira nova tentativa fica marcada para `now + computeBackoffDelay(1, 1 s, 60 s)`, com a mesma função e os mesmos valores do outbox (seção 13.2), em constantes do use case.
+- O replay de uma transação pendente devolve o estado atual (202), como descrito na seção 6.2.
+
+<!-- Worker, tentativas seguintes, limite/TTL e desfecho: a definir na etapa 7. -->
+
 ## 15. Reconciliação
 
 ## 16. Observabilidade
@@ -478,6 +610,8 @@ A migration gerada com `--initial` não inclui `down`, por isso não é usada: t
 
 ## 18. Trade-offs e limitações conhecidas
 
+- **Ordem do histórico depende do relógio das instâncias.** O `created_at` do lançamento vem do relógio da instância que o gravou. O lock garante a ordem real das alterações, mas com relógios desalinhados entre instâncias o histórico ordenado por `(created_at, id)` pode mostrar dois lançamentos invertidos, e o desempate dentro do mesmo milissegundo é pelo id. A soma do ledger, e portanto a reconciliação, não é afetada; uma auditoria encadeada (`balance_before` de cada lançamento = `balance_after` do anterior) é. Alternativa descartada: coluna de versão no ledger (seção 9.6).
+- **A API ainda não grava `FAILED`.** Um erro inesperado responde 500 `PROCESSING_FAILED` sem gravar a transação, e o reenvio com a mesma key tenta de novo. Classificar quais erros são permanentes e gravá-los como `FAILED` fica para a etapa 6, onde o consumidor SQS é o caso principal.
 - **Reversão de transação ainda pendente.** Uma reversão que chega enquanto a transação referenciada está em `PENDING_REFERENCE` é rejeitada com `REFERENCE_NOT_PROCESSED`, em vez de aguardar a resolução da referência. Encadear pendências não é exigido pelo case e adicionaria complexidade ao worker; o caso é raro (exige duas operações fora de ordem em sequência).
 
 ## 19. Uso de IA

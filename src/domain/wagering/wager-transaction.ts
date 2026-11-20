@@ -3,6 +3,7 @@ import { InvariantViolationError } from '../errors/invariant-violation.error';
 import { LedgerDirection } from '../ledger/wallet-ledger-entry';
 import type { Money } from '../money/money';
 import { InvalidMoneyError } from '../money/money.errors';
+import type { Wallet } from '../wallet/wallet';
 import { computePayloadHash } from './payload-hash';
 import {
   ALLOWED_REFERENCE_KINDS,
@@ -256,6 +257,19 @@ export class WagerTransaction {
 
   matchesPayload(payloadHash: string): boolean {
     return this.payloadHash === payloadHash;
+  }
+
+  checkWallet(wallet: Wallet): FailureCode | undefined {
+    if (wallet.id !== this.walletId) {
+      throw new InvariantViolationError('a transaction can only be checked against its own wallet');
+    }
+    if (wallet.currency !== this.money.currency) {
+      return FailureCode.CurrencyMismatch;
+    }
+    if (wallet.playerId !== this.playerId) {
+      return FailureCode.PlayerWalletMismatch;
+    }
+    return undefined;
   }
 
   checkReference(reference: WagerTransaction): FailureCode | undefined {
