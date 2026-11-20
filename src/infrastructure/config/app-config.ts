@@ -18,7 +18,20 @@ export interface AppConfig {
   sqs: {
     wagerQueueName: string;
     deadLetterQueueName: string;
+    eventsQueueName: string;
     consumerEnabled: boolean;
+  };
+  outbox: {
+    publisherEnabled: boolean;
+    pollIntervalMs: number;
+    batchSize: number;
+    publishTimeoutMs: number;
+  };
+  pendingReference: {
+    ttlMs: number;
+    workerEnabled: boolean;
+    pollIntervalMs: number;
+    batchSize: number;
   };
 }
 
@@ -80,7 +93,20 @@ export function loadConfig(): AppConfig {
     sqs: {
       wagerQueueName: readString('SQS_WAGER_QUEUE_NAME', 'wager-transactions.fifo'),
       deadLetterQueueName: readString('SQS_WAGER_DLQ_NAME', 'wager-transactions-dlq.fifo'),
+      eventsQueueName: readString('SQS_EVENTS_QUEUE_NAME', 'wagering-events.fifo'),
       consumerEnabled: readBoolean('SQS_CONSUMER_ENABLED', 'true'),
+    },
+    outbox: {
+      publisherEnabled: readBoolean('OUTBOX_PUBLISHER_ENABLED', 'true'),
+      pollIntervalMs: readPositiveInteger('OUTBOX_POLL_INTERVAL_MS', '1000'),
+      batchSize: readPositiveInteger('OUTBOX_BATCH_SIZE', '10'),
+      publishTimeoutMs: readPositiveInteger('OUTBOX_PUBLISH_TIMEOUT_MS', '5000'),
+    },
+    pendingReference: {
+      ttlMs: readPositiveInteger('PENDING_REFERENCE_TTL_MS', '3600000'),
+      workerEnabled: readBoolean('PENDING_REFERENCE_WORKER_ENABLED', 'true'),
+      pollIntervalMs: readPositiveInteger('PENDING_REFERENCE_POLL_INTERVAL_MS', '1000'),
+      batchSize: readPositiveInteger('PENDING_REFERENCE_BATCH_SIZE', '10'),
     },
   };
 }

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import type { UnitOfWork } from '../../src/application/ports/unit-of-work';
+import { PendingReferencePolicy } from '../../src/application/services/pending-reference-policy';
 import { CreateWalletUseCase } from '../../src/application/use-cases/create-wallet.use-case';
 import {
   type ProcessWagerTransactionCommand,
@@ -13,6 +14,10 @@ import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-o
 import { UuidV7IdGenerator } from '../../src/infrastructure/system/uuid-v7-id-generator';
 
 export const PRODUCTION_LOCK_TIMEOUT_MS = 2000;
+export const DEFAULT_PENDING_REFERENCE_TTL_MS = 60 * 60_000;
+
+export const defaultPendingReferencePolicy = () =>
+  new PendingReferencePolicy({ ttlMs: DEFAULT_PENDING_REFERENCE_TTL_MS });
 
 export const brl = (amount: string) => Money.from({ amount, currency: 'BRL' });
 
@@ -21,7 +26,7 @@ export function wageringUseCases(orm: MikroORM, unitOfWork: UnitOfWork = default
   const clock = { now: () => new Date() };
   return {
     createWallet: new CreateWalletUseCase(unitOfWork, ids, clock),
-    processTransaction: new ProcessWagerTransactionUseCase(unitOfWork, ids, clock),
+    processTransaction: new ProcessWagerTransactionUseCase(unitOfWork, ids, clock, defaultPendingReferencePolicy()),
   };
 }
 

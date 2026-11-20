@@ -33,6 +33,15 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
     return record ? WagerTransactionMapper.toDomain(record) : null;
   }
 
+  async findDuePendingReferences(now: Date, limit: number): Promise<WagerTransaction[]> {
+    const records = await this.em.find(
+      WagerTransactionRecord,
+      { status: WagerTransactionStatus.PendingReference, nextReferenceAttemptAt: { $lte: now } },
+      { orderBy: { nextReferenceAttemptAt: 'asc', id: 'asc' }, limit },
+    );
+    return records.map((record) => WagerTransactionMapper.toDomain(record));
+  }
+
   async save(transaction: WagerTransaction): Promise<void> {
     const data = WagerTransactionMapper.toRecord(transaction);
     const managed = this.em.getUnitOfWork().getById(WagerTransactionRecord, transaction.id);

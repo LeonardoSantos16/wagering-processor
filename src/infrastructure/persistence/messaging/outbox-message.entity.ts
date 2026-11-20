@@ -13,6 +13,10 @@ export const OutboxMessageRecord = defineEntity({
   checks: [
     { name: 'outbox_message_attempts_non_negative_check', expression: 'attempts >= 0' },
     { name: 'outbox_message_event_type_not_empty_check', expression: "event_type <> ''" },
+    {
+      name: 'outbox_message_published_without_next_attempt_check',
+      expression: 'published_at is null or next_attempt_at is null',
+    },
   ],
   properties: {
     // The id is the event id: one row per event, and the dedup key along the whole chain.

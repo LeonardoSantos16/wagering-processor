@@ -8,6 +8,8 @@ export const InboxMessageRecord = defineEntity({
       name: 'inbox_message_payload_hash_format_check',
       expression: "payload_hash ~ '^[0-9a-f]{64}$'",
     },
+    { name: 'inbox_message_consumer_name_not_empty_check', expression: "consumer_name <> ''" },
+    { name: 'inbox_message_message_id_not_empty_check', expression: "message_id <> ''" },
   ],
   properties: {
     consumerName: p.text().primary(),

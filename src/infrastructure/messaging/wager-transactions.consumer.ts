@@ -12,6 +12,7 @@ import type { ProcessWagerTransactionUseCase } from '../../application/use-cases
 import { DomainError } from '../../domain/errors/domain-error';
 import { FailureCode } from '../../domain/errors/failure-code';
 import { computeBackoffDelay } from '../../domain/shared/backoff';
+import { pause } from '../system/pause';
 import { InvalidMessageError, parseWagerTransactionMessage } from './wager-transaction-message';
 
 export interface WagerTransactionsConsumerOptions {
@@ -193,16 +194,4 @@ function isDeadLetter(error: unknown): boolean {
 
 function describe(error: unknown): string {
   return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-}
-
-function pause(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(done, ms);
-    signal.addEventListener('abort', done, { once: true });
-    function done() {
-      clearTimeout(timer);
-      signal.removeEventListener('abort', done);
-      resolve();
-    }
-  });
 }

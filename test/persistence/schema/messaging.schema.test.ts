@@ -48,6 +48,12 @@ describe('messaging tables constraints', () => {
     test('rejects an empty event type', () =>
       expectViolation(insert(message({ event_type: '' })), 'outbox_message_event_type_not_empty_check'));
 
+    test('rejects a published message with a scheduled retry', () =>
+      expectViolation(
+        insert(message({ published_at: AT, next_attempt_at: AT })),
+        'outbox_message_published_without_next_attempt_check',
+      ));
+
     test('rejects a payload that is not JSON', () =>
       expectViolation(insert(message({ payload: 'not json' })), 'invalid input syntax for type json'));
   });
@@ -78,6 +84,12 @@ describe('messaging tables constraints', () => {
 
       await insert(message({ message_id: row.message_id, consumer_name: 'reconciliation' }));
     });
+
+    test('rejects an empty consumer name', () =>
+      expectViolation(insert(message({ consumer_name: '' })), 'inbox_message_consumer_name_not_empty_check'));
+
+    test('rejects an empty message id', () =>
+      expectViolation(insert(message({ message_id: '' })), 'inbox_message_message_id_not_empty_check'));
 
     test.each(['B'.repeat(64), 'b'.repeat(63), 'g'.repeat(64)])('rejects the hash %#', (hash) =>
       expectViolation(insert(message({ payload_hash: hash })), 'inbox_message_payload_hash_format_check'),
