@@ -777,7 +777,7 @@ Vale para o publisher do outbox e para o worker de `PENDING_REFERENCE` (seção 
 - **Decisão:** responde 200 com `consistent: false` e registra um log `error` (`wallet balance diverges from the ledger`) com `walletId`, os três saldos e `checkedEntries`. Nada é corrigido: o saldo gravado continua o mesmo. A reconciliação não grava nada, não publica evento e não exige `Idempotency-Key`, então chamá-la de novo é seguro.
 - **Alternativas consideradas:** 409 ou 500 para a divergência; gravar cada reconciliação numa tabela de auditoria.
 - **Por que escolhi:** 409 e 500 significam conflito e falha, e a verificação não falhou (seção 11.1). O log e a métrica já são o registro durável que o case pede.
-- **Trade-offs / limitações:** o contador de divergências entra na etapa 10, junto com a escolha da biblioteca de métricas (seção 16.3). Até lá a sinalização é a resposta e o log.
+- **Trade-offs / limitações:** a divergência também incrementa `wagering_reconciliation_divergences_total` (seção 16.3), sem a wallet como label; a wallet afetada fica no log.
 
 ## 16. Observabilidade
 
@@ -793,7 +793,12 @@ Vale para o publisher do outbox e para o worker de `PENDING_REFERENCE` (seção 
 - **Sem dados sensíveis:** o log da requisição registra só método e URL, e o da resposta só o status. Headers `authorization` e `cookie` são removidos (`redact`), e corpos de requisição e resposta (payloads financeiros) não são logados.
 - Requisições aos health checks não geram log de acesso, para não poluir os logs com as sondagens.
 
-<!-- messageId, transactionId, walletId, providerId: a adicionar com o use case e o consumidor SQS. -->
+**Campos por ponto de entrada:**
+- **Processamento de transação (HTTP e SQS):** o decorator registra `wager transaction processed` com `transactionId`, `walletId`, `providerId`, `status`, `idempotentReplay` e, quando veio da fila, `messageId`. Pelo HTTP, o `correlationId` vem do contexto da requisição.
+- **Consumer SQS:** `message processed`, `message sent to the dead-letter queue` e `will retry` com `sqsMessageId`, `receiveCount` e `messageId`. Os campos da transação não se repetem aqui.
+- **Worker de pendências:** `transactionId`, `walletId`, `providerId`, desfecho e status.
+- **Publisher:** `eventId` dos eventos não publicados.
+- Nenhum log traz valores monetários nem o payload da transação.
 
 ### 16.2 Health checks
 
@@ -804,7 +809,45 @@ Vale para o publisher do outbox e para o worker de `PENDING_REFERENCE` (seção 
 
 ### 16.3 Métricas
 
-<!-- A definir. -->
+**Biblioteca e exposição:**
+- **Decisão:** `prom-client`, no formato texto do Prometheus, em `GET /metrics` na mesma porta da API. O endpoint é público (`@Public()`) e não gera log de acesso, como os health checks. As métricas padrão de processo do `prom-client` não são ligadas.
+- **Alternativas consideradas:** SDK de métricas do OpenTelemetry; contadores próprios com endpoint JSON; porta separada só para métricas.
+- **Por que escolhi:** é o formato padrão de coleta, leve e sem configuração de exporter. O OpenTelemetry é opcional no case e acrescentaria peças. Contadores próprios reinventariam histogramas num formato não padrão.
+- **Trade-offs / limitações:** `/metrics` fica aberto (seção 18).
+
+**Onde a instrumentação mora:**
+- **Decisão:** só na infraestrutura. Um decorator (`InstrumentedProcessWagerTransaction`) envolve o `ProcessWagerTransactionUseCase` e é a mesma instância usada pelo HTTP e pelo consumer SQS. Ele conta status, replays e conflitos, e mede a latência. Os conflitos de lock são contados no `MikroOrmUnitOfWork`, no ponto em que o 55P03 e o deadlock viram `TemporarilyUnavailableError`. Consumer, workers e controller de reconciliação contam o que já tratam. A application não sabe de métricas.
+- **Alternativas consideradas:** uma porta `Metrics` na application, chamada pelos use cases.
+- **Por que escolhi:** os resultados que as métricas precisam (status, `idempotentReplay`, tipo do erro) já saem do use case. Uma porta poria observabilidade na application e um fake a mais nos testes.
+- **Trade-offs / limitações:** o que acontece só dentro do use case fica invisível. É o caso da nova execução depois de `DuplicateIdempotencyKeyError` (seção 18).
+
+**Várias instâncias:**
+- **Decisão:** cada processo tem o próprio `Registry` em memória. Os contadores zeram no restart, e a soma entre instâncias é feita por quem coleta (`sum`, com `rate()` tratando o reset).
+- **Alternativas consideradas:** contadores no PostgreSQL.
+- **Por que escolhi:** é o modelo do Prometheus, e gravar contadores no banco acrescentaria escrita e disputa no caminho de cada transação.
+
+**Gauges consultados na coleta:**
+- **Decisão:** o outbox lag e a profundidade da DLQ são lidos no momento do `/metrics` (`collect`), com timeout de 2 s cada. O lag é `now() − min(occurred_at)` dos eventos com `published_at` nulo (0 sem pendentes), por SQL direto. A DLQ vem de `GetQueueAttributes` (`ApproximateNumberOfMessages`). Se a fonte falhar, o gauge sai como `NaN`, há um log `warn` e as demais métricas saem normalmente.
+- **Alternativas consideradas:** o publisher atualizar o lag a cada ciclo; contar na aplicação as mensagens enviadas à DLQ; responder 500 ou manter o último valor quando a fonte falha.
+- **Por que escolhi:** se o publisher travar ou estiver desligado, um gauge atualizado por ele congela, e é exatamente essa falha que o lag deve denunciar. A DLQ recebe mensagens por dois caminhos, o consumer e o redrive do SQS depois de `maxReceiveCount` (seção 12.5), e só a fila vê os dois. Um 500 apagaria todas as métricas por causa de uma dependência, e o último valor pareceria atual sem ser.
+- **Trade-offs / limitações:** as 3 instâncias reportam o mesmo valor (usa-se `max`), e cada coleta faz uma query e uma chamada ao SQS. O `prom-client` não permite omitir um gauge sem labels, por isso o `NaN`.
+
+**Catálogo:**
+
+| Métrica | Tipo | Labels | Onde é medida | Requisito do case |
+|---|---|---|---|---|
+| `wagering_transactions_total` | counter | `status` | decorator (transações novas, sem replays) e worker de pendências (`resolved`, com o status final) | transações por status |
+| `wagering_duplicates_total` | counter | `type`: `replay`, `idempotency_conflict`, `external_id_conflict`, `inbox_conflict` | decorator | duplicatas detectadas |
+| `wagering_retries_total` | counter | `component`: `sqs_consumer`, `outbox_publisher`, `pending_reference` | consumer (`ChangeMessageVisibility`), publisher (um por evento não publicado), worker (`rescheduled`) | retries |
+| `wagering_dlq_messages` | gauge | — | `GetQueueAttributes` na coleta | mensagens em DLQ |
+| `wagering_lock_conflicts_total` | counter | — | `MikroOrmUnitOfWork` (lock timeout e deadlock) | conflitos de lock |
+| `wagering_outbox_lag_seconds` | gauge | — | SQL na coleta | outbox lag |
+| `wagering_processing_duration_seconds` | histogram | — | decorator, em volta do `execute` (lock, idempotência, decisão e commit). Buckets de 5 ms a 5 s, com 2 s acompanhando o `lock_timeout` | latência de processamento |
+| `wagering_reconciliation_divergences_total` | counter | — | `WalletsController`, junto do log `error` (seção 15) | divergências contabilizadas em métrica |
+
+- Nenhum label tem cardinalidade aberta: `walletId`, `transactionId` e `providerId` ficam nos logs, não nas métricas.
+- Replays ficam fora de `transactions_total` para a mesma transação não ser contada duas vezes. A redelivery do SQS cai no mesmo `replay`.
+- A latência é a do processamento, não a ponta a ponta do SQS (`SentTimestamp` → ack), que mistura o tempo parado na fila e o backoff com a saúde do processamento.
 
 ## 17. Testes
 
@@ -959,6 +1002,10 @@ Os testes que já existiam em processo único foram mantidos: eles já provam o 
 - **Publisher segura uma conexão durante a chamada ao SQS.** A reserva com `SKIP LOCKED` mantém a transação aberta enquanto o SQS responde (seção 13.3). Com o SQS lento, cada publisher ocupa uma conexão do pool por até 5 s por ciclo. O *lease*, com publicação fora da transação, resolveria isso com mais peças.
 - **Reconciliação carrega o ledger em memória.** Os lançamentos da wallet são lidos e somados com `Money` (seção 15). Uma wallet com milhões de lançamentos pesaria em memória e tempo de resposta. A saída seria um `SUM` no SQL (`numeric` é exato) ou saldos de fechamento periódicos com reconciliação incremental.
 - **Ordem dos eventos é melhor esforço.** Retries e grupos FIFO diferentes podem entregar eventos fora de ordem (seção 13.3); o consumidor precisa usar o `walletVersion` para descartar o que chegar atrasado.
+- **`/metrics` é público.** Segue os health checks, sem autenticação nem porta separada. Em produção ficaria restrito à rede interna ou ganharia autenticação.
+- **Contadores por instância.** Zeram no restart e não são somados pela aplicação; a agregação entre instâncias é de quem coleta (seção 16.3).
+- **Nova execução por idempotency key não é medida.** Quando duas requisições com a mesma key se cruzam, o use case repete a tentativa depois do `DuplicateIdempotencyKeyError` (seção 9.5). Isso acontece dentro da application, que não sabe de métricas, e não entra em `retries_total`. A requisição que perdeu termina como `replay`, e esse sim é contado.
+- **Sem latência ponta a ponta do SQS.** O histograma mede o processamento, não o tempo desde o envio da mensagem. Fila acumulada aparece no SQS, não nesta métrica.
 
 ## 19. Uso de IA
 

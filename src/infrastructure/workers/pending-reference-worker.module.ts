@@ -8,6 +8,7 @@ import {
 import { ResolvePendingReferenceUseCase } from '../../application/use-cases/resolve-pending-reference.use-case';
 import { APP_CONFIG, type AppConfig } from '../config/app-config';
 import { WageringModule } from '../http/wagering/wagering.module';
+import { WageringMetrics } from '../metrics/wagering-metrics';
 import { PendingReferenceWorker } from './pending-reference.worker';
 import { PollingLoop } from './polling-loop';
 
@@ -17,6 +18,7 @@ export class PendingReferenceWorkerLifecycle implements OnApplicationBootstrap, 
 
   constructor(
     private readonly resolvePendingReference: ResolvePendingReferenceUseCase,
+    private readonly metrics: WageringMetrics,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
@@ -25,7 +27,7 @@ export class PendingReferenceWorkerLifecycle implements OnApplicationBootstrap, 
     if (!workerEnabled) {
       return;
     }
-    const worker = new PendingReferenceWorker(this.resolvePendingReference, { batchSize });
+    const worker = new PendingReferenceWorker(this.resolvePendingReference, { batchSize }, this.metrics);
     this.loop = new PollingLoop(() => worker.runOnce(), {
       name: PendingReferenceWorker.name,
       intervalMs: pollIntervalMs,

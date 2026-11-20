@@ -12,6 +12,7 @@ import {
 import { Money } from '../../../domain/money/money';
 import type { Wallet } from '../../../domain/wallet/wallet';
 import { moneySchema, text } from '../../validation/schemas';
+import { WageringMetrics } from '../../metrics/wagering-metrics';
 import { ResourceNotFoundError } from '../errors/resource-not-found.error';
 import { ZodValidationPipe } from '../validation/zod-validation.pipe';
 import { decodeLedgerCursor, encodeLedgerCursor } from './ledger-cursor';
@@ -58,6 +59,7 @@ export class WalletsController {
     private readonly createWallet: CreateWalletUseCase,
     private readonly getWallet: GetWalletQuery,
     private readonly listLedger: ListWalletLedgerQuery,
+    private readonly metrics: WageringMetrics,
     private readonly reconcileWallet: ReconcileWalletUseCase,
   ) {}
 
@@ -104,6 +106,7 @@ export class WalletsController {
     }
     const response = toReconciliationResponse(reconciliation);
     if (!reconciliation.consistent) {
+      this.metrics.reconciliationDivergences.inc();
       this.logger.error({ msg: 'wallet balance diverges from the ledger', ...response });
     }
     return response;

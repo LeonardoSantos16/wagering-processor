@@ -17,6 +17,7 @@ import { WagerTransactionsConsumerModule } from './infrastructure/messaging/wage
 import { PersistenceModule } from './infrastructure/persistence/persistence.module';
 import { PendingReferenceWorkerModule } from './infrastructure/workers/pending-reference-worker.module';
 import { OutboxPublisherModule } from './infrastructure/workers/outbox-publisher.module';
+import { MetricsModule } from './infrastructure/metrics/metrics.module';
 
 const CORRELATION_HEADER = 'x-correlation-id';
 
@@ -40,13 +41,14 @@ const CORRELATION_HEADER = 'x-correlation-id';
           res: (res: { statusCode: number }) => ({ statusCode: res.statusCode }),
         },
         autoLogging: {
-          ignore: (req: IncomingMessage) => req.url?.startsWith('/health') ?? false,
+          ignore: (req: IncomingMessage) => /^\/(health|metrics)/.test(req.url ?? ''),
         },
       },
     }),
     MikroOrmModule.forRoot(ormConfig),
     PersistenceModule,
     SqsModule,
+    MetricsModule,
     HealthModule,
     WalletsModule,
     WageringModule,

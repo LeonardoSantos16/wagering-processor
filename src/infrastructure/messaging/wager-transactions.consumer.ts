@@ -12,6 +12,7 @@ import type { ProcessWagerTransactionUseCase } from '../../application/use-cases
 import { DomainError } from '../../domain/errors/domain-error';
 import { FailureCode } from '../../domain/errors/failure-code';
 import { computeBackoffDelay } from '../../domain/shared/backoff';
+import type { WageringMetrics } from '../metrics/wagering-metrics';
 import { pause } from '../system/pause';
 import { InvalidMessageError, parseWagerTransactionMessage } from './wager-transaction-message';
 
@@ -44,6 +45,7 @@ export class WagerTransactionsConsumer {
     private readonly sqs: SQSClient,
     private readonly processTransaction: Pick<ProcessWagerTransactionUseCase, 'execute'>,
     options: WagerTransactionsConsumerOptions,
+    private readonly metrics?: WageringMetrics,
   ) {
     this.options = { ...DEFAULTS, ...options };
   }
@@ -116,18 +118,9 @@ export class WagerTransactionsConsumer {
     const context = { sqsMessageId: message.MessageId, receiveCount };
     try {
       const command = parseWagerTransactionMessage(message.Body, this.options.consumerName);
-      const { transaction, idempotentReplay } = await this.processTransaction.execute(command);
+      await this.processTransaction.execute(command);
       await this.delete(message);
-      this.logger.log({
-        msg: 'message processed',
-        ...context,
-        messageId: command.inbox!.messageId,
-        transactionId: transaction.id,
-        walletId: transaction.walletId,
-        providerId: transaction.provider?.providerId,
-        status: transaction.status,
-        idempotentReplay,
-      });
+      this.logger.log({ msg: 'message processed', ...context, messageId: command.inbox!.messageId });
     } catch (error) {
       if (isDeadLetter(error)) {
         await this.deadLetter(message, error, context);
@@ -159,6 +152,7 @@ export class WagerTransactionsConsumer {
   private async retryLater(message: Message, receiveCount: number, error: unknown, context: object): Promise<void> {
     const delayMs = computeBackoffDelay(receiveCount, this.options.backoffBaseMs, this.options.backoffMaxMs);
     const delaySeconds = Math.ceil(delayMs / 1000);
+    this.metrics?.retries.inc({ component: 'sqs_consumer' });
     this.logger.warn({ msg: 'message processing failed, will retry', ...context, delaySeconds, error: describe(error) });
     await this.changeVisibility(message, delaySeconds);
   }
