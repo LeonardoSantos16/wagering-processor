@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { CreateWalletUseCase } from '../../../application/use-cases/create-wallet.use-case';
 import { Money } from '../../../domain/money/money';
 import type { Wallet } from '../../../domain/wallet/wallet';
-import { moneySchema, text } from '../validation/schemas';
+import { moneySchema, text } from '../../validation/schemas';
 import { ZodValidationPipe } from '../validation/zod-validation.pipe';
 
 const createWalletSchema = z.object({

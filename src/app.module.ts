@@ -13,6 +13,7 @@ import { AuthGuard } from './infrastructure/http/auth/auth.guard';
 import { GlobalExceptionFilter } from './infrastructure/http/errors/global-exception.filter';
 import { WageringModule } from './infrastructure/http/wagering/wagering.module';
 import { WalletsModule } from './infrastructure/http/wallets/wallets.module';
+import { WagerTransactionsConsumerModule } from './infrastructure/messaging/wager-transactions-consumer.module';
 import { PersistenceModule } from './infrastructure/persistence/persistence.module';
 
 const CORRELATION_HEADER = 'x-correlation-id';
@@ -47,6 +48,7 @@ const CORRELATION_HEADER = 'x-correlation-id';
     HealthModule,
     WalletsModule,
     WageringModule,
+    WagerTransactionsConsumerModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: AuthGuard },

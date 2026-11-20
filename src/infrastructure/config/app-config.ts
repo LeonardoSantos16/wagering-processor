@@ -17,6 +17,8 @@ export interface AppConfig {
   };
   sqs: {
     wagerQueueName: string;
+    deadLetterQueueName: string;
+    consumerEnabled: boolean;
   };
 }
 
@@ -46,6 +48,14 @@ function readPositiveInteger(name: string, fallback: string): number {
   return value;
 }
 
+function readBoolean(name: string, fallback: string): boolean {
+  const raw = readString(name, fallback);
+  if (raw !== 'true' && raw !== 'false') {
+    throw new Error(`Invalid boolean in ${name}: ${raw}`);
+  }
+  return raw === 'true';
+}
+
 export function loadConfig(): AppConfig {
   const awsEndpoint = process.env.AWS_ENDPOINT ?? 'http://localhost:4566';
   return {
@@ -69,6 +79,8 @@ export function loadConfig(): AppConfig {
     },
     sqs: {
       wagerQueueName: readString('SQS_WAGER_QUEUE_NAME', 'wager-transactions.fifo'),
+      deadLetterQueueName: readString('SQS_WAGER_DLQ_NAME', 'wager-transactions-dlq.fifo'),
+      consumerEnabled: readBoolean('SQS_CONSUMER_ENABLED', 'true'),
     },
   };
 }
