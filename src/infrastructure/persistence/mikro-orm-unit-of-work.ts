@@ -12,6 +12,7 @@ import {
   WalletAlreadyExistsError,
 } from '../../application/errors/persistence.errors';
 import type { TransactionalRepositories, UnitOfWork } from '../../application/ports/unit-of-work';
+import type { WageringMetrics } from '../metrics/wagering-metrics';
 import { MikroOrmWalletLedgerRepository } from './ledger/mikro-orm-wallet-ledger.repository';
 import { MikroOrmInboxRepository } from './messaging/mikro-orm-inbox.repository';
 import { MikroOrmOutboxRepository } from './messaging/mikro-orm-outbox.repository';
@@ -20,6 +21,7 @@ import { MikroOrmWalletRepository } from './wallet/mikro-orm-wallet.repository';
 
 export interface UnitOfWorkOptions {
   lockTimeoutMs: number;
+  metrics?: WageringMetrics;
 }
 
 export class MikroOrmUnitOfWork implements UnitOfWork {
@@ -42,7 +44,7 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
         { isolationLevel: IsolationLevel.READ_COMMITTED },
       );
     } catch (error) {
-      throw translate(error);
+      throw this.translate(error);
     }
   }
 
@@ -53,8 +55,16 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
         readOnly: true,
       });
     } catch (error) {
-      throw translate(error);
+      throw this.translate(error);
     }
+  }
+
+  private translate(error: unknown): unknown {
+    const translated = translate(error);
+    if (translated instanceof TemporarilyUnavailableError) {
+      this.options.metrics?.lockConflicts.inc();
+    }
+    return translated;
   }
 }
 

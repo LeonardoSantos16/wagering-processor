@@ -6,7 +6,8 @@ import {
   type OnApplicationBootstrap,
 } from '@nestjs/common';
 import { GetQueueUrlCommand, SQSClient } from '@aws-sdk/client-sqs';
-import { ProcessWagerTransactionUseCase } from '../../application/use-cases/process-wager-transaction.use-case';
+import { InstrumentedProcessWagerTransaction } from '../metrics/instrumented-process-wager-transaction';
+import { WageringMetrics } from '../metrics/wagering-metrics';
 import { APP_CONFIG, type AppConfig } from '../config/app-config';
 import { WageringModule } from '../http/wagering/wagering.module';
 import { WagerTransactionsConsumer } from './wager-transactions.consumer';
@@ -19,7 +20,8 @@ export class WagerTransactionsConsumerLifecycle implements OnApplicationBootstra
 
   constructor(
     private readonly sqs: SQSClient,
-    private readonly processTransaction: ProcessWagerTransactionUseCase,
+    private readonly processTransaction: InstrumentedProcessWagerTransaction,
+    private readonly metrics: WageringMetrics,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
@@ -35,7 +37,7 @@ export class WagerTransactionsConsumerLifecycle implements OnApplicationBootstra
       queueUrl,
       dlqUrl,
       consumerName: WAGER_TRANSACTIONS_CONSUMER_NAME,
-    });
+    }, this.metrics);
     this.consumer.start();
   }
 

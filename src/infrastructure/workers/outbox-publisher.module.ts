@@ -11,6 +11,7 @@ import { UNIT_OF_WORK, type UnitOfWork } from '../../application/ports/unit-of-w
 import { PublishOutboxUseCase } from '../../application/use-cases/publish-outbox.use-case';
 import { APP_CONFIG, type AppConfig } from '../config/app-config';
 import { SqsEventPublisher } from '../messaging/sqs-event-publisher';
+import { WageringMetrics } from '../metrics/wagering-metrics';
 import { OutboxPublisherWorker } from './outbox-publisher.worker';
 import { PollingLoop } from './polling-loop';
 
@@ -20,6 +21,7 @@ export class OutboxPublisherLifecycle implements OnApplicationBootstrap, BeforeA
 
   constructor(
     private readonly publishOutbox: PublishOutboxUseCase,
+    private readonly metrics: WageringMetrics,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
@@ -28,7 +30,7 @@ export class OutboxPublisherLifecycle implements OnApplicationBootstrap, BeforeA
     if (!publisherEnabled) {
       return;
     }
-    const worker = new OutboxPublisherWorker(this.publishOutbox, { batchSize });
+    const worker = new OutboxPublisherWorker(this.publishOutbox, { batchSize }, this.metrics);
     this.loop = new PollingLoop(() => worker.runOnce(), {
       name: OutboxPublisherWorker.name,
       intervalMs: pollIntervalMs,

@@ -7,6 +7,8 @@ import { ProcessWagerTransactionUseCase } from '../../../application/use-cases/p
 import { ResolvePendingReferenceUseCase } from '../../../application/use-cases/resolve-pending-reference.use-case';
 import { APP_CONFIG, type AppConfig } from '../../config/app-config';
 import { GetWagerTransactionQuery } from '../../../application/queries/get-wager-transaction.query';
+import { InstrumentedProcessWagerTransaction } from '../../metrics/instrumented-process-wager-transaction';
+import { WageringMetrics } from '../../metrics/wagering-metrics';
 import { ProviderTransactionsController } from './provider-transactions.controller';
 import { WageringTransactionsController } from './wagering-transactions.controller';
 
@@ -24,10 +26,19 @@ import { WageringTransactionsController } from './wagering-transactions.controll
       useFactory: (config: AppConfig) => new PendingReferencePolicy({ ttlMs: config.pendingReference.ttlMs }),
     },
     {
-      provide: ProcessWagerTransactionUseCase,
-      inject: [UNIT_OF_WORK, ID_GENERATOR, CLOCK, PendingReferencePolicy],
-      useFactory: (unitOfWork: UnitOfWork, ids: IdGenerator, clock: Clock, policy: PendingReferencePolicy) =>
-        new ProcessWagerTransactionUseCase(unitOfWork, ids, clock, policy),
+      provide: InstrumentedProcessWagerTransaction,
+      inject: [UNIT_OF_WORK, ID_GENERATOR, CLOCK, PendingReferencePolicy, WageringMetrics],
+      useFactory: (
+        unitOfWork: UnitOfWork,
+        ids: IdGenerator,
+        clock: Clock,
+        policy: PendingReferencePolicy,
+        metrics: WageringMetrics,
+      ) =>
+        new InstrumentedProcessWagerTransaction(
+          new ProcessWagerTransactionUseCase(unitOfWork, ids, clock, policy),
+          metrics,
+        ),
     },
     {
       provide: ResolvePendingReferenceUseCase,
@@ -36,6 +47,6 @@ import { WageringTransactionsController } from './wagering-transactions.controll
         new ResolvePendingReferenceUseCase(unitOfWork, ids, clock, policy),
     },
   ],
-  exports: [ProcessWagerTransactionUseCase, ResolvePendingReferenceUseCase],
+  exports: [InstrumentedProcessWagerTransaction, ResolvePendingReferenceUseCase],
 })
 export class WageringModule {}

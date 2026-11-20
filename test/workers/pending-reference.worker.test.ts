@@ -3,7 +3,9 @@ import type {
   PendingReferenceRef,
   ResolvePendingReferenceResult,
 } from '../../src/application/use-cases/resolve-pending-reference.use-case';
+import type { WagerTransaction } from '../../src/domain/wagering/wager-transaction';
 import { PendingReferenceWorker } from '../../src/infrastructure/workers/pending-reference.worker';
+import { metricValue, testMetrics } from '../support/metrics';
 
 describe('PendingReferenceWorker', () => {
   const refs = (count: number): PendingReferenceRef[] =>
@@ -37,5 +39,25 @@ describe('PendingReferenceWorker', () => {
 
     expect(await worker.runOnce()).toEqual({ full: true, failed: true });
     expect(attempted).toEqual(['tx-0', 'tx-1', 'tx-2']);
+  });
+
+  test('counts resolved references by final status and rescheduled ones as retries', async () => {
+    const metrics = testMetrics();
+    const outcomes: ResolvePendingReferenceResult[] = [
+      { outcome: 'resolved', transaction: { status: 'PROCESSED' } as unknown as WagerTransaction },
+      { outcome: 'resolved', transaction: { status: 'REJECTED' } as unknown as WagerTransaction },
+      { outcome: 'rescheduled' },
+    ];
+    const worker = new PendingReferenceWorker(
+      { findDue: async () => refs(3), execute: async () => outcomes.shift()! },
+      { batchSize: 3 },
+      metrics,
+    );
+
+    await worker.runOnce();
+
+    expect(await metricValue(metrics, 'wagering_transactions_total', { status: 'PROCESSED' })).toBe(1);
+    expect(await metricValue(metrics, 'wagering_transactions_total', { status: 'REJECTED' })).toBe(1);
+    expect(await metricValue(metrics, 'wagering_retries_total', { component: 'pending_reference' })).toBe(1);
   });
 });

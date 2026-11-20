@@ -3,11 +3,9 @@ import { Body, Controller, Get, Headers, Param, Post, Req, Res } from '@nestjs/c
 import { HttpAdapterHost } from '@nestjs/core';
 import { z } from 'zod';
 import { GetWagerTransactionQuery } from '../../../application/queries/get-wager-transaction.query';
-import {
-  type ProcessWagerTransactionResult,
-  ProcessWagerTransactionUseCase,
-} from '../../../application/use-cases/process-wager-transaction.use-case';
+import type { ProcessWagerTransactionResult } from '../../../application/use-cases/process-wager-transaction.use-case';
 import { Money } from '../../../domain/money/money';
+import { InstrumentedProcessWagerTransaction } from '../../metrics/instrumented-process-wager-transaction';
 import { WagerTransactionStatus } from '../../../domain/wagering/wager-transaction-status';
 import {
   parseSubmittableKind,
@@ -36,7 +34,7 @@ const HTTP_STATUS_BY_TRANSACTION_STATUS: Partial<Record<WagerTransactionStatus, 
 @Controller('wagering/transactions')
 export class WageringTransactionsController {
   constructor(
-    private readonly processTransaction: ProcessWagerTransactionUseCase,
+    private readonly processTransaction: InstrumentedProcessWagerTransaction,
     private readonly getTransaction: GetWagerTransactionQuery,
     private readonly adapterHost: HttpAdapterHost,
   ) {}

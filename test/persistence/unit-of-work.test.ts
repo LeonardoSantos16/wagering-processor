@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { ForeignKeyConstraintViolationException, type MikroORM } from '@mikro-orm/postgresql';
 import { createTestOrm } from '../support/database';
+import { metricValue, testMetrics } from '../support/metrics';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm-unit-of-work';
 import { Wallet } from '../../src/domain/wallet/wallet';
 import { Money } from '../../src/domain/money/money';
@@ -95,7 +96,8 @@ describe('MikroOrmUnitOfWork', () => {
       await transactions.save(openingTransaction);
       await ledger.append(openingEntry);
     });
-    const impatient = new MikroOrmUnitOfWork(orm.em, { lockTimeoutMs: 100 });
+    const metrics = testMetrics();
+    const impatient = new MikroOrmUnitOfWork(orm.em, { lockTimeoutMs: 100, metrics });
 
     let lockAcquired!: () => void;
     const acquired = new Promise<void>((resolve) => (lockAcquired = resolve));
@@ -114,6 +116,7 @@ describe('MikroOrmUnitOfWork', () => {
     await expect(contender).rejects.toBeInstanceOf(TemporarilyUnavailableError);
     releaseLock();
     await holder;
+    expect(await metricValue(metrics, 'wagering_lock_conflicts_total')).toBe(1);
   });
 
   describe('translates unique violations by constraint name', () => {
