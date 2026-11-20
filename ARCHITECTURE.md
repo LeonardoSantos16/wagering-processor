@@ -190,7 +190,23 @@ stateDiagram-v2
 
 ### 7.2 Mapeamento domínio × ORM
 
-<!-- A decidir na etapa 3. -->
+- **Decisão:** modelos de persistência separados (`defineEntity` sem classe própria, com tipos inferidos) mais um mapper por agregado, que converte a linha do banco no `State` do domínio e usa o `rehydrate`. O Unit of Work continua em uso, só que sobre os modelos de persistência:
+  - Agregado novo: o repositório faz `em.create` e `persist`.
+  - Agregado alterado: o repositório pega a entidade gerenciada pelo identity map do `EntityManager` da requisição e aplica o estado do domínio com `em.assign`. O `flush` gera o `UPDATE` só das colunas que mudaram.
+  - A atomicidade vem de `em.transactional`.
+- **Alternativas consideradas:**
+  - Mapear as classes de domínio direto no ORM (`defineEntity({ class })` ou `EntitySchema`): menos código, mas o ORM passa a determinar a forma das classes de domínio, e o construtor privado exige um cast por entidade.
+  - Repositórios sem Unit of Work (`insert`/`nativeUpdate` explícitos): SQL totalmente visível, mas mais código de repositório.
+- **Por que escolhi:**
+  - O domínio já expõe `rehydrate(state)`, então o mapper é uma conversão direta.
+  - O domínio fica livre do ORM, inclusive em forma, não só em imports.
+  - O `defineEntity` é usado na forma recomendada, com inferência completa.
+  - A conversão de `Money` fica explícita e testável.
+  - É um padrão que já conheço.
+- **Trade-offs:**
+  - Cada agregado tem duas definições (domínio e persistência) mais um mapper.
+  - Uma mudança em campo persistido exige ajustar o mapper.
+  - A `version` da `Wallet` é incrementada pelo domínio e persistida como uma coluna comum, sem `version: true`, para não ser incrementada duas vezes. Como ela participa do controle de concorrência é decidido na etapa 4 (seção 9).
 
 **Observação do spike:** uma classe com construtor `private` e sem decorators pode ser mapeada via `EntitySchema`. Em runtime funciona (o ORM reidrata sem chamar o construtor), mas o TypeScript recusa o construtor privado no `EntitySchema`, o que exige um cast (`as unknown as EntityCtor<T>`) em cada entidade.
 
