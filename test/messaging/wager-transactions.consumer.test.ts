@@ -118,7 +118,7 @@ describe('WagerTransactionsConsumer', () => {
     } else {
       expect(received[0]!.failureReason).toBeUndefined();
     }
-    expect(await messagesInQueue(sqs, queues.queueUrl)).toBe(0);
+    await eventually(async () => (await messagesInQueue(sqs, queues.queueUrl)) === 0);
   };
 
   beforeAll(async () => {
