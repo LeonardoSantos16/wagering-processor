@@ -8,6 +8,7 @@ export interface WagerTransactionRepository {
     externalTransactionId: string,
   ): Promise<WagerTransaction | null>;
   findProcessedReversalOf(referenceTransactionId: string): Promise<WagerTransaction | null>;
+  findDuePendingReferences(now: Date, limit: number): Promise<WagerTransaction[]>;
   save(transaction: WagerTransaction): Promise<void>;
 }
 

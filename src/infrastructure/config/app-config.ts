@@ -20,6 +20,12 @@ export interface AppConfig {
     deadLetterQueueName: string;
     consumerEnabled: boolean;
   };
+  pendingReference: {
+    ttlMs: number;
+    workerEnabled: boolean;
+    pollIntervalMs: number;
+    batchSize: number;
+  };
 }
 
 function readString(name: string, fallback?: string): string {
@@ -81,6 +87,12 @@ export function loadConfig(): AppConfig {
       wagerQueueName: readString('SQS_WAGER_QUEUE_NAME', 'wager-transactions.fifo'),
       deadLetterQueueName: readString('SQS_WAGER_DLQ_NAME', 'wager-transactions-dlq.fifo'),
       consumerEnabled: readBoolean('SQS_CONSUMER_ENABLED', 'true'),
+    },
+    pendingReference: {
+      ttlMs: readPositiveInteger('PENDING_REFERENCE_TTL_MS', '3600000'),
+      workerEnabled: readBoolean('PENDING_REFERENCE_WORKER_ENABLED', 'true'),
+      pollIntervalMs: readPositiveInteger('PENDING_REFERENCE_POLL_INTERVAL_MS', '1000'),
+      batchSize: readPositiveInteger('PENDING_REFERENCE_BATCH_SIZE', '10'),
     },
   };
 }

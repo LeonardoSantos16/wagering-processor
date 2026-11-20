@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { createTestOrm } from '../support/database';
+import { defaultPendingReferencePolicy } from '../support/wagering';
 import { expectBalanceMatchesLedger, outboxEventsOfWallet } from '../support/wallet-invariants';
 import { CreateWalletUseCase } from '../../src/application/use-cases/create-wallet.use-case';
 import {
@@ -77,7 +78,7 @@ describe('ProcessWagerTransactionUseCase', () => {
     const ids = new UuidV7IdGenerator();
     const clock = { now: () => now };
     createWallet = new CreateWalletUseCase(unitOfWork, ids, clock);
-    useCase = new ProcessWagerTransactionUseCase(unitOfWork, ids, clock);
+    useCase = new ProcessWagerTransactionUseCase(unitOfWork, ids, clock, defaultPendingReferencePolicy());
   });
 
   afterAll(async () => {
