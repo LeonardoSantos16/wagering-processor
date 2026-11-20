@@ -58,6 +58,20 @@ describe('wallet, ledger and outbox atomicity', () => {
     await expectBalanceMatchesLedger(unitOfWork, wallet.id);
   });
 
+  test('a failure after the debit was written also rolls back the inbox record of a queue message', async () => {
+    const wallet = await newWallet(createWallet, '100.00');
+    const inbox = { consumerName: 'test-consumer', messageId: `msg-${crypto.randomUUID()}` };
+    const command = { ...betFor(wallet, '30.00'), inbox };
+
+    await expect(failingProcessTransaction.execute(command)).rejects.toBeInstanceOf(ForcedFailure);
+
+    expect(await unitOfWork.run((repositories) => repositories.inbox.find(inbox.consumerName, inbox.messageId))).toBeNull();
+    const retry = await processTransaction.execute(command);
+    expect(retry.idempotentReplay).toBe(false);
+    expect(retry.transaction.balanceAfter?.toJSON().amount).toBe('70.00');
+    await expectBalanceMatchesLedger(unitOfWork, wallet.id);
+  });
+
   test('the same request succeeds normally after the failed attempt', async () => {
     const wallet = await newWallet(createWallet, '100.00');
     const command = betFor(wallet, '30.00');
