@@ -16,6 +16,7 @@ import { WalletsModule } from './infrastructure/http/wallets/wallets.module';
 import { WagerTransactionsConsumerModule } from './infrastructure/messaging/wager-transactions-consumer.module';
 import { PersistenceModule } from './infrastructure/persistence/persistence.module';
 import { PendingReferenceWorkerModule } from './infrastructure/workers/pending-reference-worker.module';
+import { OutboxPublisherModule } from './infrastructure/workers/outbox-publisher.module';
 
 const CORRELATION_HEADER = 'x-correlation-id';
 
@@ -51,6 +52,7 @@ const CORRELATION_HEADER = 'x-correlation-id';
     WageringModule,
     WagerTransactionsConsumerModule,
     PendingReferenceWorkerModule,
+    OutboxPublisherModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: AuthGuard },

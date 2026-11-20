@@ -1,3 +1,4 @@
+import { LockMode } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import type { OutboxRepository } from '../../../application/ports/outbox.repository';
 import { OutboxMessage } from '../../../domain/messaging/outbox-message';
@@ -9,6 +10,15 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
   async findById(id: string): Promise<OutboxMessage | null> {
     const record = await this.em.findOne(OutboxMessageRecord, { id });
     return record ? toDomain(record) : null;
+  }
+
+  async findDueForUpdate(now: Date, limit: number): Promise<OutboxMessage[]> {
+    const records = await this.em.find(
+      OutboxMessageRecord,
+      { publishedAt: null, $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: now } }] },
+      { orderBy: { occurredAt: 'asc', id: 'asc' }, limit, lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE },
+    );
+    return records.map(toDomain);
   }
 
   async save(message: OutboxMessage): Promise<void> {

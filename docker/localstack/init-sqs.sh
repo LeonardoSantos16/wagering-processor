@@ -1,7 +1,12 @@
 #!/bin/bash
 # Creates the SQS queues required by the case.
+# wagering-events.fifo receives the integration events published from the outbox (ARCHITECTURE.md, section 13).
 # Transient failures reach the DLQ through the redrive policy after 8 receives (ARCHITECTURE.md, section 12).
 set -euo pipefail
+
+awslocal sqs create-queue \
+  --queue-name wagering-events.fifo \
+  --attributes FifoQueue=true
 
 DLQ_URL=$(awslocal sqs create-queue \
   --queue-name wager-transactions-dlq.fifo \

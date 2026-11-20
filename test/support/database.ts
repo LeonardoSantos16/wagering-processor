@@ -30,3 +30,24 @@ export function insertRow(orm: MikroORM, table: string, row: Record<string, unkn
     Object.values(row),
   );
 }
+
+export interface TemporaryDatabase {
+  orm: MikroORM;
+  drop(): Promise<void>;
+}
+
+export async function createTemporaryDatabase(prefix: string): Promise<TemporaryDatabase> {
+  const dbName = `${prefix}_${process.pid}_${Date.now()}`;
+  const admin = await MikroORM.init(ormConfig);
+  await admin.em.getConnection().execute(`create database "${dbName}"`);
+  const orm = await MikroORM.init({ ...ormConfig, dbName });
+  await orm.migrator.up();
+  return {
+    orm,
+    drop: async () => {
+      await orm.close();
+      await admin.em.getConnection().execute(`drop database if exists "${dbName}"`);
+      await admin.close();
+    },
+  };
+}

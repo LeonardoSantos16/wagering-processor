@@ -29,7 +29,7 @@ describe('SQS consumer inside the application', () => {
       .overrideProvider(APP_CONFIG)
       .useValue({
         ...config,
-        sqs: { wagerQueueName: queues.queueName, deadLetterQueueName: queues.dlqName, consumerEnabled: true },
+        sqs: { ...config.sqs, wagerQueueName: queues.queueName, deadLetterQueueName: queues.dlqName, consumerEnabled: true },
       })
       .compile();
     app = moduleRef.createNestApplication({ logger: false });

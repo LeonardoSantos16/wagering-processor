@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   CreateQueueCommand,
+  DeleteMessageCommand,
   DeleteQueueCommand,
   GetQueueAttributesCommand,
   ReceiveMessageCommand,
@@ -124,4 +125,34 @@ export async function receiveMessages(sqs: SQSClient, queueUrl: string): Promise
     body: message.Body!,
     failureReason: message.MessageAttributes?.failureReason?.StringValue,
   }));
+}
+
+export interface PublishedEvent {
+  body: Record<string, unknown>;
+  groupId: string | undefined;
+  deduplicationId: string | undefined;
+  eventType: string | undefined;
+}
+
+export async function drainEvents(sqs: SQSClient, queueUrl: string): Promise<PublishedEvent[]> {
+  const { Messages } = await sqs.send(
+    new ReceiveMessageCommand({
+      QueueUrl: queueUrl,
+      MaxNumberOfMessages: 10,
+      WaitTimeSeconds: 1,
+      MessageAttributeNames: ['All'],
+      MessageSystemAttributeNames: ['MessageGroupId', 'MessageDeduplicationId'],
+    }),
+  );
+  const events: PublishedEvent[] = [];
+  for (const message of Messages ?? []) {
+    events.push({
+      body: JSON.parse(message.Body!) as Record<string, unknown>,
+      groupId: message.Attributes?.MessageGroupId,
+      deduplicationId: message.Attributes?.MessageDeduplicationId,
+      eventType: message.MessageAttributes?.eventType?.StringValue,
+    });
+    await sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle }));
+  }
+  return events;
 }

@@ -28,6 +28,7 @@ export class FailingOnOutboxUnitOfWork implements UnitOfWork {
         ...repositories,
         outbox: {
           findById: (id) => repositories.outbox.findById(id),
+          findDueForUpdate: (now, limit) => repositories.outbox.findDueForUpdate(now, limit),
           save: async (message: OutboxMessage) => {
             await repositories.outbox.save(message);
             const walletId = String((message.payload.data as { walletId: string }).walletId);
