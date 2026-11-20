@@ -2,6 +2,8 @@ import { defineConfig } from '@mikro-orm/postgresql';
 import { Migrator } from '@mikro-orm/migrations';
 import { loadConfig } from '../config/app-config';
 import { WalletLedgerEntryRecord } from './ledger/wallet-ledger-entry.entity';
+import { InboxMessageRecord } from './messaging/inbox-message.entity';
+import { OutboxMessageRecord } from './messaging/outbox-message.entity';
 import { WagerTransactionRecord } from './wager-transaction/wager-transaction.entity';
 import { WalletRecord } from './wallet/wallet.entity';
 
@@ -13,7 +15,13 @@ export default defineConfig({
   user: db.user,
   password: db.password,
   dbName: db.name,
-  entities: [WalletRecord, WagerTransactionRecord, WalletLedgerEntryRecord],
+  entities: [
+    WalletRecord,
+    WagerTransactionRecord,
+    WalletLedgerEntryRecord,
+    OutboxMessageRecord,
+    InboxMessageRecord,
+  ],
   extensions: [Migrator],
   migrations: {
     path: 'src/infrastructure/persistence/migrations',
