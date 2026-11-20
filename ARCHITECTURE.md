@@ -764,7 +764,7 @@ Vale para o publisher do outbox e para o worker de `PENDING_REFERENCE` (seção 
 
 ### 17.1 Concorrência do núcleo
 
-- **Decisão:** os cenários rodam em duas camadas. No use case (`test/application/process-wager-transaction.concurrency.test.ts`), as chamadas são disparadas com `Promise.all`. Por HTTP (`test/http/wagering-transactions.concurrency.e2e.test.ts`), o `AppModule` sobe e recebe `fetch` em paralelo, cobrindo o 50× e o 80/80. O paralelismo é real no PostgreSQL: até 10 conexões do pool disputam o `FOR UPDATE` ao mesmo tempo. A execução com várias instâncias fica para a etapa 8.
+- **Decisão:** os cenários rodam em duas camadas. No use case (`test/application/process-wager-transaction.concurrency.test.ts`), as chamadas são disparadas com `Promise.all`. Por HTTP (`test/http/wagering-transactions.concurrency.e2e.test.ts`), o `AppModule` sobe e recebe `fetch` em paralelo, cobrindo o 50× e o 80/80. O paralelismo é real no PostgreSQL: até 10 conexões do pool disputam o `FOR UPDATE` ao mesmo tempo. A execução com várias instâncias está na seção 17.5.
 - **Alternativas consideradas:** só o use case (mais rápido, sem cobrir o mapeamento HTTP sob corrida); só HTTP (mais lento, com o Express no caminho de todos os cenários).
 - **Por que escolhi:** o use case isola o núcleo (lock e idempotência) e permite cenários mais finos, como o lock retido numa wallet. O HTTP confirma que, sob corrida, o provedor recebe os status e corpos certos: 49 replays idênticos ao original, e 201/422 no 80/80.
 - **Cenários:**
@@ -839,6 +839,59 @@ Vale para o publisher do outbox e para o worker de `PENDING_REFERENCE` (seção 
   O `EventPublisher` falso só é usado nos casos que o SQS não permite provocar de forma confiável; o banco é sempre real.
 - **Cenário da aplicação:** `ROLLBACK` antes da `BET`. O worker resolve a pendência, o saldo bate com o ledger e os eventos das duas transações chegam à fila. Os tipos são comparados sem ordem, porque os eventos de transação e o `WalletBalanceChanged` estão em grupos FIFO diferentes (seção 13.3).
 - **Prova de que o teste de concorrência detecta o erro:** sem o `FOR UPDATE SKIP LOCKED` na busca, os publishers reservam as mesmas linhas e o teste falha (numa execução, a soma chegou a 155 para 60 eventos).
+
+### 17.5 Falhas e múltiplas instâncias
+
+- **Decisão:** os testes de `test/resilience/` sobem a aplicação como **processos separados** (`Bun.spawn` de `src/main.ts`, helper `test/support/app-process.ts`), cada um com a própria porta, o próprio pool de conexões e a configuração por env. A morte é real (`SIGKILL`, sem shutdown gracioso). Cada arquivo usa um banco temporário próprio (`createTemporaryDatabase`) e filas temporárias (visibilidade de 5 s), apagados no fim. Os testes rodam no `bun test` padrão.
+- **Alternativas consideradas:**
+  - várias instâncias do `AppModule` no processo do `bun test` (mais barato, mas o event loop é compartilhado e não existe morte real: o `app.close()` é um shutdown gracioso);
+  - réplicas no `docker compose` (mais realista, mas exige um Dockerfile, o ciclo fica lento e matar no ponto exato é difícil).
+- **Por que escolhi:** só processos separados exercitam os mecanismos de recuperação: a conexão que cai e faz o PostgreSQL desfazer a transação e soltar os locks, o visibility timeout que devolve a mensagem e o restart do zero. Como toda a configuração vem do env (seção 1.1), cada processo aponta para o banco e as filas do teste sem nenhuma mudança na aplicação.
+- **Trade-offs / limitações:** cada processo leva cerca de 1 s para ficar pronto (`/health/ready`). Os três arquivos somam cerca de 20 s.
+
+**Como o processo morre no ponto exato:**
+- **Decisão:** um **proxy de SQS só de teste** (`test/support/sqs-proxy.ts`, um `Bun.serve`) fica entre a instância e o LocalStack. Ele repassa todas as chamadas, menos a ação que o teste segura (identificada pelo cabeçalho `X-Amz-Target` do protocolo JSON do SQS). A chamada segurada nunca recebe resposta: a instância fica parada exatamente naquele ponto, o proxy avisa o teste, e o teste dá o `SIGKILL`.
+- **Alternativas consideradas:** um hook de falha no código de produção, ligado por env (`FAULT_INJECTION=...`); só o cenário natural (uma instância com o publisher desligado processa e morre), que não alcança o ponto entre o commit e o ack; reproduzir o estado que o crash deixaria, sem crash (como na seção 17.3).
+- **Por que escolhi:** acerta os dois pontos que o case cita sem nenhuma linha de teste dentro da aplicação. O ack só acontece depois do commit, então segurar o `DeleteMessage` é parar "depois do commit e antes do ack". O publisher publica com a transação aberta (seção 13.3), então segurar o `SendMessageBatch` é parar "com os eventos reservados e não publicados".
+
+**O estado é verificado antes do kill:** o teste não confere só o resultado final, confere também que a instância estava no ponto perigoso.
+- Consumidor: quando o `DeleteMessage` é segurado, a transação e o inbox já estão no banco. Sem isso, o teste passaria com um consumidor que desse ack antes de processar: o delete segurado não chegaria ao SQS e a mensagem voltaria do mesmo jeito.
+- Publisher: um `SELECT … FOR UPDATE SKIP LOCKED` feito pelo teste não encontra nenhuma linha da outbox, o que prova que a instância morta as reservou. Isso evita esperar um tempo para ver que outra instância "não publicou", que seria um `sleep` disfarçado.
+
+**Determinismo:** a espera é sempre por sinais: o `/health/ready` de cada processo, a promise do proxy ao segurar a chamada e o `eventually()` sobre banco e filas. A saída dos processos é capturada e só aparece na mensagem de erro quando o teste falha (`AppCluster.explainFailure`).
+
+**Cenários:**
+
+| Cenário | Como é provocado | O que é verificado |
+|---|---|---|
+| morte depois do commit e antes do ack (`consumer-crash.test.ts`) | o proxy segura o `DeleteMessage` da instância A; `SIGKILL`; a instância B sobe | antes do kill: transação e inbox gravados. Depois: a mensagem volta em 5 s, B a apaga como redelivery; uma transação, um lançamento, um inbox, saldo 75,00 = ledger, DLQ vazia |
+| morte antes de publicar (`publisher-crash.test.ts`) | `BET` confirmada; o proxy segura o `SendMessageBatch` de A (timeout de publicação de 60 s); `SIGKILL`; B sobe | antes do kill: nenhuma linha livre para `SKIP LOCKED`. Depois: nenhum evento pendente e os `eventId` na fila são exatamente os da outbox |
+| restart com consistência final (`restart-consistency.test.ts`) | 3 instâncias com consumidor, publisher e worker; 30 mensagens em 3 wallets e 30 `BET` por HTTP na mesma wallet, divididas entre as 3; `SIGKILL` em todas depois de 20 transações; 3 instâncias novas; o teste reenvia, com a mesma idempotency key, as requisições HTTP sem resposta | cada transação existe uma vez e está `PROCESSED`; um lançamento por transação; saldos exatos (965,00 / 995,00 / 995,00) e iguais ao ledger; um inbox por mensagem; outbox sem pendentes; `eventId` recebidos = os da outbox (duplicatas toleradas); DLQ vazia |
+
+No restart, a fila tem `maxReceiveCount = 8`, como em produção: a disputa do lock entre HTTP e fila na mesma wallet pode custar alguns recebimentos. Em três execuções, o kill pegou de 21 a 25 transações gravadas, de 21 a 23 requisições HTTP sem resposta e de 14 a 16 mensagens ainda na fila.
+
+O mesmo teste cobre as ≥ 3 instâncias sobre a mesma wallet: com `MessageGroupId = walletId`, o FIFO entrega uma mensagem por vez por wallet, então só a fila não geraria disputa entre instâncias. A disputa vem do HTTP das 3 instâncias somado ao consumidor, e é o lock da wallet que a resolve.
+
+**Tarefas da etapa e onde estão cobertas:**
+
+| Tarefa | Teste |
+|---|---|
+| ≥ 3 instâncias simultâneas sobre a mesma fila/wallet | `restart-consistency.test.ts` |
+| worker morto depois do commit e antes do ack | `consumer-crash.test.ts` (em processo único, também em `wager-transactions.consumer.test.ts`, seção 17.3) |
+| dois publishers sobre a mesma outbox | `publish-outbox.use-case.test.ts`, 3 publishers em paralelo (seção 17.4); com processos, `publisher-crash.test.ts` |
+| processo morre depois do commit e antes de publicar | `publisher-crash.test.ts` |
+| `ROLLBACK`/`REFUND` antes da referência | `out-of-order-reference.e2e.test.ts` e `resolve-pending-reference.use-case.test.ts` (seção 17.4) |
+| reinício com comprovação de consistência final | `restart-consistency.test.ts` |
+
+Os testes que já existiam em processo único foram mantidos: eles já provam o `SKIP LOCKED` e o worker, e os novos cobrem só o que exige processos separados.
+
+**Prova de que os testes detectam o erro:** três mutações, cada uma revertida depois.
+
+| Mutação | Resultado |
+|---|---|
+| consumidor dá ack antes de processar | falham `consumer-crash` (nada gravado quando o delete é segurado) e `restart-consistency` (as mensagens em andamento no kill se perdem) |
+| busca da outbox sem `FOR UPDATE SKIP LOCKED` | falha `publisher-crash` (as linhas não estão presas pela instância morta) |
+| use case sem a busca pela idempotency key | falha `consumer-crash` (o redelivery não vira replay). O `restart-consistency` passa: o kill não pega nenhuma mensagem ou requisição no intervalo entre o commit e a resposta, que dura milissegundos, então não há replay a fazer. Esse ponto exato é o que o `consumer-crash` provoca |
 
 ## 18. Trade-offs e limitações conhecidas
 
