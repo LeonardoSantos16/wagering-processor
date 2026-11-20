@@ -4,6 +4,7 @@ import { InvariantViolationError } from '../errors/invariant-violation.error';
 import { LedgerDirection } from '../ledger/wallet-ledger-entry';
 import { Money } from '../money/money';
 import { InvalidMoneyError } from '../money/money.errors';
+import { Wallet } from '../wallet/wallet';
 import { computePayloadHash } from './payload-hash';
 import { WagerTransaction } from './wager-transaction';
 import { WagerTransactionKind } from './wager-transaction-kind';
@@ -452,6 +453,53 @@ describe('WagerTransaction', () => {
       expect(() =>
         opening.reject({ code: FailureCode.InsufficientFunds, balanceAfter: brl('1.00'), at: LATER }),
       ).toThrow(InvalidTransactionStateError);
+    });
+  });
+
+  describe('checkWallet', () => {
+    function wallet(overrides: { id?: string; playerId?: string; currency?: string } = {}): Wallet {
+      return Wallet.open({
+        id: overrides.id ?? 'wallet-1',
+        playerId: overrides.playerId ?? 'player-1',
+        initialBalance: Money.from({ amount: '100.00', currency: overrides.currency ?? 'BRL' }),
+        openingTransactionId: 'opening-1',
+        openingEntryId: 'entry-1',
+        now: NOW,
+      }).wallet;
+    }
+
+    test('accepts the wallet of the same player in the same currency', () => {
+      expect(tx(WagerTransactionKind.Bet).checkWallet(wallet())).toBeUndefined();
+    });
+
+    test('a wallet in another currency is CURRENCY_MISMATCH', () => {
+      expect(tx(WagerTransactionKind.Bet).checkWallet(wallet({ currency: 'USD' }))).toBe(
+        FailureCode.CurrencyMismatch,
+      );
+    });
+
+    test('a wallet of another player is PLAYER_WALLET_MISMATCH', () => {
+      expect(tx(WagerTransactionKind.Bet).checkWallet(wallet({ playerId: 'player-2' }))).toBe(
+        FailureCode.PlayerWalletMismatch,
+      );
+    });
+
+    test('currency is checked first, because only CURRENCY_MISMATCH can be recorded without a balance', () => {
+      const result = tx(WagerTransactionKind.Bet).checkWallet(wallet({ playerId: 'player-2', currency: 'USD' }));
+
+      expect(result).toBe(FailureCode.CurrencyMismatch);
+    });
+
+    test('also applies to a LOSS, which never touches the wallet balance', () => {
+      expect(tx(WagerTransactionKind.Loss).checkWallet(wallet({ currency: 'USD' }))).toBe(
+        FailureCode.CurrencyMismatch,
+      );
+    });
+
+    test('checking a wallet other than the one the transaction targets is a programming error', () => {
+      const error = captureError(() => tx(WagerTransactionKind.Bet).checkWallet(wallet({ id: 'wallet-2' })));
+
+      expect(error).toBeInstanceOf(InvariantViolationError);
     });
   });
 

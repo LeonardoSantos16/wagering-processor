@@ -7,6 +7,7 @@ export interface WagerTransactionRepository {
     providerId: string,
     externalTransactionId: string,
   ): Promise<WagerTransaction | null>;
+  findProcessedReversalOf(referenceTransactionId: string): Promise<WagerTransaction | null>;
   save(transaction: WagerTransaction): Promise<void>;
 }
 
