@@ -109,6 +109,16 @@
       ],
       "checks": [
         {
+          "name": "inbox_message_consumer_name_not_empty_check",
+          "expression": "consumer_name <> ''",
+          "definition": "check (consumer_name <> '')"
+        },
+        {
+          "name": "inbox_message_message_id_not_empty_check",
+          "expression": "message_id <> ''",
+          "definition": "check (message_id <> '')"
+        },
+        {
           "name": "inbox_message_payload_hash_format_check",
           "expression": "payload_hash ~ '^[0-9a-f]{64}$'",
           "definition": "check (payload_hash ~ '^[0-9a-f]{64}$')"
@@ -292,6 +302,11 @@
           "name": "outbox_message_event_type_not_empty_check",
           "expression": "event_type <> ''",
           "definition": "check (event_type <> '')"
+        },
+        {
+          "name": "outbox_message_published_without_next_attempt_check",
+          "expression": "published_at is null or next_attempt_at is null",
+          "definition": "check (published_at is null or next_attempt_at is null)"
         }
       ],
       "triggers": [],
