@@ -32,6 +32,7 @@ export function insertRow(orm: MikroORM, table: string, row: Record<string, unkn
 }
 
 export interface TemporaryDatabase {
+  name: string;
   orm: MikroORM;
   drop(): Promise<void>;
 }
@@ -43,6 +44,7 @@ export async function createTemporaryDatabase(prefix: string): Promise<Temporary
   const orm = await MikroORM.init({ ...ormConfig, dbName });
   await orm.migrator.up();
   return {
+    name: dbName,
     orm,
     drop: async () => {
       await orm.close();
