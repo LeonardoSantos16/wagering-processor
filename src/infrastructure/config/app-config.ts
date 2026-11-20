@@ -7,6 +7,7 @@ export interface AppConfig {
     user: string;
     password: string;
     name: string;
+    lockTimeoutMs: number;
   };
   aws: {
     region: string;
@@ -36,6 +37,15 @@ function readPort(name: string, fallback: string): number {
   return value;
 }
 
+function readPositiveInteger(name: string, fallback: string): number {
+  const raw = readString(name, fallback);
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`Invalid positive integer in ${name}: ${raw}`);
+  }
+  return value;
+}
+
 export function loadConfig(): AppConfig {
   const awsEndpoint = process.env.AWS_ENDPOINT ?? 'http://localhost:4566';
   return {
@@ -47,6 +57,7 @@ export function loadConfig(): AppConfig {
       user: readString('DB_USER', 'wagering'),
       password: readString('DB_PASSWORD', 'wagering'),
       name: readString('DB_NAME', 'wagering'),
+      lockTimeoutMs: readPositiveInteger('WALLET_LOCK_TIMEOUT_MS', '2000'),
     },
     aws: {
       region: readString('AWS_REGION', 'us-east-1'),

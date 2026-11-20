@@ -1,3 +1,4 @@
+import { LockMode } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import type { WalletRepository } from '../../../application/ports/wallet.repository';
 import type { Wallet } from '../../../domain/wallet/wallet';
@@ -9,6 +10,15 @@ export class MikroOrmWalletRepository implements WalletRepository {
 
   async findById(id: string): Promise<Wallet | null> {
     const record = await this.em.findOne(WalletRecord, { id });
+    return record ? WalletMapper.toDomain(record) : null;
+  }
+
+  async findByIdForUpdate(id: string): Promise<Wallet | null> {
+    const record = await this.em.findOne(
+      WalletRecord,
+      { id },
+      { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true },
+    );
     return record ? WalletMapper.toDomain(record) : null;
   }
 
