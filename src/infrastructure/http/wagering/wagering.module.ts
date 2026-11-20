@@ -6,11 +6,18 @@ import { PendingReferencePolicy } from '../../../application/services/pending-re
 import { ProcessWagerTransactionUseCase } from '../../../application/use-cases/process-wager-transaction.use-case';
 import { ResolvePendingReferenceUseCase } from '../../../application/use-cases/resolve-pending-reference.use-case';
 import { APP_CONFIG, type AppConfig } from '../../config/app-config';
+import { GetWagerTransactionQuery } from '../../../application/queries/get-wager-transaction.query';
+import { ProviderTransactionsController } from './provider-transactions.controller';
 import { WageringTransactionsController } from './wagering-transactions.controller';
 
 @Module({
-  controllers: [WageringTransactionsController],
+  controllers: [WageringTransactionsController, ProviderTransactionsController],
   providers: [
+    {
+      provide: GetWagerTransactionQuery,
+      inject: [UNIT_OF_WORK],
+      useFactory: (unitOfWork: UnitOfWork) => new GetWagerTransactionQuery(unitOfWork),
+    },
     {
       provide: PendingReferencePolicy,
       inject: [APP_CONFIG],

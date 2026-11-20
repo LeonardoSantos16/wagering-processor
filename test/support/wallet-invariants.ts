@@ -1,6 +1,7 @@
 import { expect } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import type { UnitOfWork } from '../../src/application/ports/unit-of-work';
+import { ReconcileWalletUseCase } from '../../src/application/use-cases/reconcile-wallet.use-case';
 import { LedgerDirection } from '../../src/domain/ledger/wallet-ledger-entry';
 import { Money } from '../../src/domain/money/money';
 import type { IntegrationEventEnvelope } from '../../src/domain/events/integration-event';
@@ -18,6 +19,10 @@ export async function expectBalanceMatchesLedger(unitOfWork: UnitOfWork, walletI
     Money.zero(wallet!.currency),
   );
   expect(replayed.toJSON()).toEqual(wallet!.balance.toJSON());
+
+  const reconciliation = await new ReconcileWalletUseCase(unitOfWork).execute(walletId);
+  expect(reconciliation?.consistent).toBe(true);
+  expect(reconciliation?.checkedEntries).toBe(entries.length);
 }
 
 export async function outboxEventsOfWallet(

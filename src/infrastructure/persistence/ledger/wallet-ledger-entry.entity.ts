@@ -14,7 +14,7 @@ export const WalletLedgerEntryRecord = defineEntity({
     },
   ],
   indexes: [
-    { name: 'wallet_ledger_entry_wallet_created_at_index', properties: ['walletId', 'createdAt'] },
+    { name: 'wallet_ledger_entry_wallet_created_at_id_index', properties: ['walletId', 'createdAt', 'id'] },
   ],
   checks: [
     { name: 'wallet_ledger_entry_amount_positive_check', expression: 'amount > 0' },
