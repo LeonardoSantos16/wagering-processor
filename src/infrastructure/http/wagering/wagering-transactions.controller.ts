@@ -1,6 +1,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { Body, Controller, Headers, Post, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Param, Post, Req, Res } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
+import { z } from 'zod';
+import { GetWagerTransactionQuery } from '../../../application/queries/get-wager-transaction.query';
 import {
   type ProcessWagerTransactionResult,
   ProcessWagerTransactionUseCase,
@@ -14,9 +16,15 @@ import {
 } from '../../validation/wager-transaction-request';
 import { MissingIdempotencyKeyError } from '../errors/missing-idempotency-key.error';
 import { RequestValidationError } from '../errors/request-validation.error';
+import { ResourceNotFoundError } from '../errors/resource-not-found.error';
 import { ZodValidationPipe } from '../validation/zod-validation.pipe';
+import { toWagerTransactionView } from './wager-transaction-view';
 
 const MAX_IDEMPOTENCY_KEY_LENGTH = 255;
+
+const transactionParamsSchema = z.object({ transactionId: z.uuid() });
+
+type TransactionParams = z.infer<typeof transactionParamsSchema>;
 
 const HTTP_STATUS_BY_TRANSACTION_STATUS: Partial<Record<WagerTransactionStatus, number>> = {
   [WagerTransactionStatus.Processed]: 201,
@@ -29,6 +37,7 @@ const HTTP_STATUS_BY_TRANSACTION_STATUS: Partial<Record<WagerTransactionStatus, 
 export class WageringTransactionsController {
   constructor(
     private readonly processTransaction: ProcessWagerTransactionUseCase,
+    private readonly getTransaction: GetWagerTransactionQuery,
     private readonly adapterHost: HttpAdapterHost,
   ) {}
 
@@ -57,6 +66,15 @@ export class WageringTransactionsController {
 
     const [status, payload] = toResponse(result);
     this.adapterHost.httpAdapter.reply(response, payload, status);
+  }
+
+  @Get(':transactionId')
+  async findOne(@Param(new ZodValidationPipe(transactionParamsSchema)) { transactionId }: TransactionParams) {
+    const transaction = await this.getTransaction.byId(transactionId);
+    if (!transaction) {
+      throw ResourceNotFoundError.transaction(transactionId);
+    }
+    return toWagerTransactionView(transaction);
   }
 }
 

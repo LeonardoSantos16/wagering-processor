@@ -22,6 +22,10 @@ export class FailingOnOutboxUnitOfWork implements UnitOfWork {
 
   constructor(private readonly inner: UnitOfWork) {}
 
+  runReadOnly<T>(work: (repositories: TransactionalRepositories) => Promise<T>): Promise<T> {
+    return this.inner.runReadOnly(work);
+  }
+
   run<T>(work: (repositories: TransactionalRepositories) => Promise<T>): Promise<T> {
     return this.inner.run((repositories) =>
       work({

@@ -4,6 +4,7 @@ import { DomainError } from '../../../domain/errors/domain-error';
 import { FailureCode } from '../../../domain/errors/failure-code';
 import { HTTP_STATUS_BY_FAILURE_CODE } from './http-status';
 import { RequestValidationError } from './request-validation.error';
+import { ResourceNotFoundError } from './resource-not-found.error';
 
 export interface ErrorResponseBody {
   failureCode?: FailureCode;
@@ -25,6 +26,9 @@ export class GlobalExceptionFilter implements ExceptionFilter {
   private toResponse(exception: unknown): [number, ErrorResponseBody] {
     if (exception instanceof RequestValidationError) {
       return [400, { failureCode: exception.code, message: exception.message, details: exception.issues }];
+    }
+    if (exception instanceof ResourceNotFoundError) {
+      return [404, { failureCode: exception.code, message: exception.message }];
     }
     if (exception instanceof DomainError) {
       return [

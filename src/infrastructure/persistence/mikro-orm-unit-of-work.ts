@@ -45,6 +45,17 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
       throw translate(error);
     }
   }
+
+  async runReadOnly<T>(work: (repositories: TransactionalRepositories) => Promise<T>): Promise<T> {
+    try {
+      return await this.em.fork().transactional((em) => work(repositoriesFor(em)), {
+        isolationLevel: IsolationLevel.REPEATABLE_READ,
+        readOnly: true,
+      });
+    } catch (error) {
+      throw translate(error);
+    }
+  }
 }
 
 const UNIQUE_VIOLATIONS: Record<string, () => Error> = {

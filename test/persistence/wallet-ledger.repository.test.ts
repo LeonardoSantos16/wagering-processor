@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { createTestOrm } from '../support/database';
+import type { LedgerPosition } from '../../src/application/ports/wallet-ledger.repository';
 import { MikroOrmWalletLedgerRepository } from '../../src/infrastructure/persistence/ledger/mikro-orm-wallet-ledger.repository';
 import { MikroOrmWagerTransactionRepository } from '../../src/infrastructure/persistence/wager-transaction/mikro-orm-wager-transaction.repository';
 import { MikroOrmWalletRepository } from '../../src/infrastructure/persistence/wallet/mikro-orm-wallet.repository';
@@ -124,5 +125,104 @@ describe('MikroOrmWalletLedgerRepository', () => {
 
   test('returns an empty history for a wallet without entries', async () => {
     expect(await new MikroOrmWalletLedgerRepository(orm.em.fork()).findByWallet(randomUUID())).toEqual([]);
+  });
+
+  describe('findPage', () => {
+    const persist = (wallet: Wallet, transactions: WagerTransaction[], entries: WalletLedgerEntry[]) =>
+      orm.em.fork().transactional(async (em) => {
+        const wallets = new MikroOrmWalletRepository(em);
+        await wallets.findById(wallet.id);
+        await wallets.save(wallet);
+        const transactionRepository = new MikroOrmWagerTransactionRepository(em);
+        const ledger = new MikroOrmWalletLedgerRepository(em);
+        for (const transaction of transactions) {
+          await transactionRepository.save(transaction);
+        }
+        for (const entry of entries) {
+          await ledger.append(entry);
+        }
+      });
+
+    const credit = (wallet: Wallet, amount: string, second: number) => {
+      const win = providerTransaction(wallet, WagerTransactionKind.Win, amount, second);
+      const entry = wallet.credit({ amount: win.money, transactionId: win.id, entryId: randomUUID(), now: at(second) });
+      win.markProcessed({ balanceAfter: wallet.balance, at: at(second) });
+      return { transaction: win, entry };
+    };
+
+    const walletWithTies = async () => {
+      const { wallet, entries } = await walletWithHistory();
+      const tied = [1, 2, 3, 4].map(() => credit(wallet, '1.00', 1));
+      await persist(
+        wallet,
+        tied.map((movement) => movement.transaction),
+        tied.map((movement) => movement.entry),
+      );
+      const all = [...entries, ...tied.map((movement) => movement.entry)];
+      const newestFirst = all.toSorted(
+        (a, b) => b.createdAt.getTime() - a.createdAt.getTime() || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+      );
+      return { wallet, newestFirst };
+    };
+
+    const readAllPages = async (walletId: string, limit: number) => {
+      const repository = new MikroOrmWalletLedgerRepository(orm.em.fork());
+      const pages: string[][] = [];
+      let after: LedgerPosition | undefined;
+      for (;;) {
+        const page = await repository.findPage(walletId, after, limit);
+        if (page.length === 0) {
+          return pages;
+        }
+        pages.push(page.map((entry) => entry.id));
+        const last = page.at(-1)!;
+        after = { createdAt: last.createdAt, id: last.id };
+      }
+    };
+
+    test('pages newest first, breaking createdAt ties by id, without gaps or repeats', async () => {
+      const { wallet, newestFirst } = await walletWithTies();
+
+      const pages = await readAllPages(wallet.id, 2);
+
+      expect(pages.map((page) => page.length)).toEqual([2, 2, 2, 1]);
+      expect(pages.flat()).toEqual(newestFirst.map((entry) => entry.id));
+    });
+
+    test('a cursor in the middle of a createdAt tie continues with the remaining tied entries', async () => {
+      const { wallet, newestFirst } = await walletWithTies();
+      const repository = new MikroOrmWalletLedgerRepository(orm.em.fork());
+      const middle = newestFirst[3]!;
+
+      const page = await repository.findPage(wallet.id, { createdAt: middle.createdAt, id: middle.id }, 10);
+
+      expect(page.map((entry) => entry.id)).toEqual(newestFirst.slice(4).map((entry) => entry.id));
+    });
+
+    test('entries appended between pages do not shift the following pages', async () => {
+      const { wallet, newestFirst } = await walletWithTies();
+      const repository = new MikroOrmWalletLedgerRepository(orm.em.fork());
+      const first = await repository.findPage(wallet.id, undefined, 3);
+      const last = first.at(-1)!;
+
+      const later = credit(wallet, '5.00', 30);
+      await persist(wallet, [later.transaction], [later.entry]);
+      const rest = await new MikroOrmWalletLedgerRepository(orm.em.fork()).findPage(
+        wallet.id,
+        { createdAt: last.createdAt, id: last.id },
+        100,
+      );
+
+      expect([...first, ...rest].map((entry) => entry.id)).toEqual(newestFirst.map((entry) => entry.id));
+    });
+
+    test('does not return entries of other wallets', async () => {
+      const { wallet, entries } = await walletWithHistory();
+      await walletWithHistory();
+
+      const page = await new MikroOrmWalletLedgerRepository(orm.em.fork()).findPage(wallet.id, undefined, 100);
+
+      expect(page.map((entry) => entry.id).toSorted()).toEqual(entries.map((entry) => entry.id).toSorted());
+    });
   });
 });

@@ -1259,11 +1259,12 @@
         {
           "columnNames": [
             "wallet_id",
-            "created_at"
+            "created_at",
+            "id"
           ],
           "composite": true,
           "constraint": false,
-          "keyName": "wallet_ledger_entry_wallet_created_at_index",
+          "keyName": "wallet_ledger_entry_wallet_created_at_id_index",
           "primary": false,
           "unique": false
         },
