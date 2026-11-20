@@ -132,6 +132,16 @@ describe('WagerTransactionRejected', () => {
     });
   });
 
+  test('omits the balance for a CURRENCY_MISMATCH rejection', () => {
+    const tx = transaction();
+    tx.reject({ code: FailureCode.CurrencyMismatch, at: LATER });
+
+    const { data } = WagerTransactionRejected.from(tx, CTX).toJSON();
+
+    expect(data.failureCode).toBe(FailureCode.CurrencyMismatch);
+    expect('balanceAfter' in data).toBe(false);
+  });
+
   test('requires a REJECTED transaction', () => {
     expect(() => WagerTransactionRejected.from(transaction(), CTX)).toThrow(InvariantViolationError);
   });

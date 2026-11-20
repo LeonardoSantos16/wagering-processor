@@ -286,6 +286,51 @@ describe('WagerTransaction', () => {
       expect(transaction.processedAt).toBeUndefined();
     });
 
+    test('CURRENCY_MISMATCH is rejected without a balance', () => {
+      const transaction = tx(WagerTransactionKind.Bet);
+
+      transaction.reject({ code: FailureCode.CurrencyMismatch, at: LATER });
+
+      expect(transaction.status).toBe(WagerTransactionStatus.Rejected);
+      expect(transaction.failureCode).toBe(FailureCode.CurrencyMismatch);
+      expect(transaction.balanceAfter).toBeUndefined();
+    });
+
+    test('CURRENCY_MISMATCH cannot record a balance', () => {
+      expect(() =>
+        tx(WagerTransactionKind.Bet).reject({
+          code: FailureCode.CurrencyMismatch,
+          balanceAfter: Money.from({ amount: '10.00', currency: 'USD' }),
+          at: LATER,
+        }),
+      ).toThrow(InvariantViolationError);
+    });
+
+    test('any other rejection requires the observed balance', () => {
+      expect(() =>
+        tx(WagerTransactionKind.Bet).reject({ code: FailureCode.InsufficientFunds, at: LATER }),
+      ).toThrow(InvariantViolationError);
+    });
+
+    test('reject requires the balance in the transaction currency', () => {
+      expect(() =>
+        tx(WagerTransactionKind.Bet).reject({
+          code: FailureCode.InsufficientFunds,
+          balanceAfter: Money.from({ amount: '10.00', currency: 'USD' }),
+          at: LATER,
+        }),
+      ).toThrow(InvariantViolationError);
+    });
+
+    test('markProcessed requires the balance in the transaction currency', () => {
+      expect(() =>
+        tx(WagerTransactionKind.Bet).markProcessed({
+          balanceAfter: Money.from({ amount: '10.00', currency: 'USD' }),
+          at: LATER,
+        }),
+      ).toThrow(InvariantViolationError);
+    });
+
     test('PENDING -> FAILED records the failure code without a balance', () => {
       const transaction = tx(WagerTransactionKind.Bet);
 
@@ -433,7 +478,7 @@ describe('WagerTransaction', () => {
       });
       transaction.markProcessed({
         referenceTransactionId: transaction.referenceExternalTransactionId ? 'tx-000' : undefined,
-        balanceAfter: brl('100.00'),
+        balanceAfter: Money.from({ amount: '100.00', currency: transaction.money.currency }),
         at: AT,
       });
       return transaction;

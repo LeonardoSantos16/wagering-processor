@@ -58,7 +58,7 @@ export interface MarkProcessedProps {
 
 export interface RejectProps {
   code: FailureCode;
-  balanceAfter: Money;
+  balanceAfter?: Money;
   at: Date;
 }
 
