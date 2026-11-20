@@ -8,6 +8,7 @@ import {
 import { computeBackoffDelay } from '../../domain/shared/backoff';
 import { WalletBalanceChanged } from '../../domain/events/wallet-balance-changed';
 import { LedgerDirection, type WalletLedgerEntry } from '../../domain/ledger/wallet-ledger-entry';
+import { InboxMessage } from '../../domain/messaging/inbox-message';
 import { OutboxMessage } from '../../domain/messaging/outbox-message';
 import type { Money } from '../../domain/money/money';
 import { WagerTransaction } from '../../domain/wagering/wager-transaction';
@@ -15,9 +16,14 @@ import type { WagerTransactionKind } from '../../domain/wagering/wager-transacti
 import type { ProviderRef } from '../../domain/wagering/wager-transaction.types';
 import type { Wallet } from '../../domain/wallet/wallet';
 import { DuplicateIdempotencyKeyError, ExternalTransactionConflictError } from '../errors/persistence.errors';
-import { IdempotencyConflictError, WalletNotFoundError } from '../errors/wager-transaction.errors';
+import {
+  IdempotencyConflictError,
+  InboxMessageConflictError,
+  WalletNotFoundError,
+} from '../errors/wager-transaction.errors';
 import type { Clock } from '../ports/clock';
 import type { IdGenerator } from '../ports/id-generator';
+import type { InboxRepository } from '../ports/inbox.repository';
 import type { TransactionalRepositories, UnitOfWork } from '../ports/unit-of-work';
 import type { WagerTransactionRepository } from '../ports/wager-transaction.repository';
 
@@ -29,6 +35,12 @@ export interface ProcessWagerTransactionCommand {
   money: Money;
   referenceExternalTransactionId?: string;
   correlationId: string;
+  inbox?: InboxRef;
+}
+
+export interface InboxRef {
+  consumerName: string;
+  messageId: string;
 }
 
 export interface ProcessWagerTransactionResult {
@@ -87,12 +99,15 @@ export class ProcessWagerTransactionUseCase {
         throw new WalletNotFoundError(command.walletId);
       }
 
+      const recordInbox = await this.checkInbox(repositories.inbox, command.inbox, candidate.payloadHash!, now);
+
       const { providerId, idempotencyKey, externalTransactionId } = command.provider;
       const previous = await transactions.findByIdempotencyKey(providerId, idempotencyKey);
       if (previous) {
         if (!previous.matchesPayload(candidate.payloadHash!)) {
           throw new IdempotencyConflictError();
         }
+        await recordInbox();
         return { transaction: previous, idempotentReplay: true };
       }
       if (await transactions.findByExternalId(providerId, externalTransactionId)) {
@@ -101,9 +116,29 @@ export class ProcessWagerTransactionUseCase {
 
       const decision = await this.decide(candidate, wallet, providerId, transactions);
       const outcome = this.apply(candidate, wallet, decision, now, command.correlationId);
+      await recordInbox();
       await this.persist(repositories, candidate, wallet, outcome);
       return { transaction: candidate, idempotentReplay: false };
     });
+  }
+
+  private async checkInbox(
+    inbox: InboxRepository,
+    ref: InboxRef | undefined,
+    payloadHash: string,
+    now: Date,
+  ): Promise<() => Promise<void>> {
+    if (!ref) {
+      return async () => {};
+    }
+    const received = await inbox.find(ref.consumerName, ref.messageId);
+    if (received) {
+      if (!received.matchesPayload(payloadHash)) {
+        throw new InboxMessageConflictError(ref.messageId);
+      }
+      return async () => {};
+    }
+    return () => inbox.save(processedInbox(ref, payloadHash, now));
   }
 
   private async decide(
@@ -209,4 +244,10 @@ export class ProcessWagerTransactionUseCase {
       await outbox.save(OutboxMessage.enqueue(event));
     }
   }
+}
+
+function processedInbox({ consumerName, messageId }: InboxRef, payloadHash: string, now: Date): InboxMessage {
+  const message = InboxMessage.receive({ consumerName, messageId, payloadHash, receivedAt: now });
+  message.markProcessed(now);
+  return message;
 }

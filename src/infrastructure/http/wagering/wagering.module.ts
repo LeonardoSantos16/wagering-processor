@@ -15,5 +15,6 @@ import { WageringTransactionsController } from './wagering-transactions.controll
         new ProcessWagerTransactionUseCase(unitOfWork, ids, clock),
     },
   ],
+  exports: [ProcessWagerTransactionUseCase],
 })
 export class WageringModule {}

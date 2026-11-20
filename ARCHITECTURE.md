@@ -63,13 +63,14 @@ src/
   application/     use cases (orquestram uma transação SQL) e portas
                    (interfaces de repositórios, publisher, relógio etc.)
   infrastructure/  adaptadores: persistence (MikroORM), messaging (SQS),
-                   http (controllers, health, auth), config
+                   http (controllers, health, auth), validation (schemas
+                   compartilhados por HTTP e fila), config
   main.ts, app.module.ts
 ```
 
 **Regra de dependência:** `infrastructure → application → domain`. O domínio não importa nada de fora dele, nem `@nestjs/*`, nem `@mikro-orm/*`. A regra é verificada por um teste automático (`test/architecture.test.ts`), que falha se algum arquivo de `src/domain/` importar esses pacotes ou as outras camadas.
 
-**Erros de domínio:** uma classe base abstrata `DomainError` carrega um `code: FailureCode` (seção 11.2), com uma subclasse por situação (ex.: `InvalidMoneyError` → `INVALID_MONEY`). A camada HTTP converte qualquer `DomainError` em resposta pelo `code`, sem conhecer cada erro. O `InvalidTransactionStateError` fica **fora** dessa hierarquia: é erro de programação, não regra de negócio, e resulta em 500.
+**Erros de domínio:** uma classe base abstrata `DomainError` carrega um `code: FailureCode` (seção 11.2), com uma subclasse por situação (ex.: `InvalidMoneyError` → `INVALID_MONEY`). A camada HTTP converte qualquer `DomainError` em resposta pelo `code`, sem conhecer cada erro. O `InvalidTransactionStateError` fica **fora** dessa hierarquia: é erro de programação, não regra de negócio, e resulta em 500. Também ficam fora os erros internos que nunca chegam ao provedor e só são tratados por quem os conhece: `DuplicateIdempotencyKeyError` (seção 9.5) e `InboxMessageConflictError` (seção 12.1).
 
 **Testes:** os de unidade ficam ao lado do código (`*.test.ts` em `src/`); os de integração, concorrência e e2e, que precisam de infraestrutura rodando, ficam em `test/`.
 
@@ -377,6 +378,7 @@ A migration gerada com `--initial` não inclui `down`, por isso não é usada: t
 1. Fora da transação: validar o payload (400) e montar a transação candidata, que calcula o `payloadHash` (seção 10.1).
 2. `BEGIN` + `SET LOCAL lock_timeout`.
 3. Travar a wallet. Se não existir, `WALLET_NOT_FOUND` (seção 6.2).
+   - Entrada pela fila: consultar o inbox (seção 12.1).
 4. Buscar pela idempotency key: mesmo hash → replay; hash diferente → `IDEMPOTENCY_CONFLICT` (seção 10.2).
 5. Buscar pelo `(providerId, externalTransactionId)`: se existir, `EXTERNAL_TRANSACTION_CONFLICT`.
 6. Regras de negócio, na ordem da seção 6.2, resultando em `PROCESSED`, `REJECTED` ou `PENDING_REFERENCE`.
@@ -453,12 +455,12 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 **Validação de entrada:**
 - **Decisão:** schemas zod na camada HTTP, aplicados por um pipe próprio (`ZodValidationPipe`). O schema garante a forma do payload; o formato do valor monetário continua sendo validado pelo `Money.from` (`INVALID_MONEY`).
 - **Alternativas consideradas:** `class-validator` + `class-transformer` (padrão da documentação do NestJS); validação manual.
-- **Por que escolhi:** o schema é TypeScript puro e gera o tipo do comando, e o mesmo schema poderá validar as mensagens do consumidor SQS, que não passa pelos pipes do NestJS.
+- **Por que escolhi:** o schema é TypeScript puro e gera o tipo do comando, e o mesmo schema valida o `data` das mensagens do consumidor SQS, que não passa pelos pipes do NestJS (`src/infrastructure/validation/`).
 - **Trade-offs / limitações:** uma dependência a mais. O pipe roda antes do handler, então uma requisição com corpo inválido e sem `Idempotency-Key` recebe `INVALID_PAYLOAD`, não `MISSING_IDEMPOTENCY_KEY` (as duas são 400).
 
 **Detalhes da validação:**
 - `walletId` é validado como UUID: um valor qualquer chegaria à coluna `uuid` e o banco recusaria a consulta com erro de sintaxe, respondendo 500.
-- `kind` é aceito como string pelo schema e convertido no controller: um valor fora do enum, ou `OPENING`, responde `INVALID_KIND` (e não `INVALID_PAYLOAD`), como a taxonomia exige.
+- `kind` é aceito como string pelo schema e convertido depois (`parseSubmittableKind`, usado pela API e pela fila): um valor fora do enum, ou `OPENING`, responde `INVALID_KIND` (e não `INVALID_PAYLOAD`), como a taxonomia exige.
 - JSON malformado responde 400 `INVALID_PAYLOAD`. Outros erros HTTP do framework (por exemplo, rota inexistente) saem com o status deles e só `message`, sem `failureCode`, porque nenhum código da taxonomia corresponde a eles.
 
 ### 11.2 Taxonomia de `failureCode`
@@ -511,11 +513,77 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 - **Decisão:** deduplicação persistente por `(consumerName, messageId)`, gravada na mesma transação SQL da alteração financeira. O inbox guarda o `payloadHash` da mensagem, calculado com o **mesmo algoritmo do `payloadHash` da transação** (seção 10) sobre os campos de negócio do `data`.
 - **Alternativas consideradas:** hash do corpo inteiro da mensagem; deduplicar apenas pela idempotency key da transação.
 - **Por que escolhi:** um único algoritmo de hash no sistema, que não depende de metadados de transporte (como o `occurredAt` do envelope). O inbox protege contra a reentrega da **mensagem**; a idempotency key protege contra a repetição da **operação**. São camadas diferentes, e o case exige as duas.
-- **Trade-offs / limitações:** <!-- a definir -->
+- **Trade-offs / limitações:** uma linha por mensagem, sem limpeza (a retenção do inbox não foi tratada). Um `messageId` reaproveitado pelo produtor muito tempo depois, com outro conteúdo, continua sendo recusado.
 
 **Mesmo `messageId` com conteúdo diferente:** tratado como erro permanente (logado, contabilizado em métrica e enviado para a DLQ), sem processar. É um erro do produtor; processar uma das duas versões seria uma escolha arbitrária.
 
-<!-- Ack, classificação de erros, retry, DLQ e shutdown: a definir na etapa 6. -->
+**Como o inbox entra no use case:**
+- **Decisão:** campo opcional `inbox: { consumerName, messageId }` no comando do `ProcessWagerTransactionUseCase`. O HTTP não o envia. Quando presente, o use case consulta o inbox **logo depois do lock da wallet e antes da idempotência** (seção 9.4):
+  - sem registro → grava a linha (já com `processed_at`) na mesma transação, qualquer que seja o desfecho gravado (`PROCESSED`, `REJECTED`, `PENDING_REFERENCE`) e também no replay por idempotency key: toda mensagem que recebe ack tem uma linha no inbox;
+  - registro com o mesmo hash → redelivery: nada é gravado de novo, e a idempotência devolve o resultado original (`idempotentReplay: true`);
+  - registro com hash diferente → `InboxMessageConflictError`, nada é gravado.
+- **Alternativas consideradas:** separar um núcleo do use case que recebe os repositórios já abertos, com o consumidor montando a própria transação; um callback `beforeCommit` passado no comando.
+- **Por que escolhi:** o case exige o mesmo use case e o inbox na mesma transação, e o use case é quem abre a transação. O campo opcional é a menor mudança: a nova execução após `DuplicateIdempotencyKeyError` (seção 9.5) continua num lugar só. Consultar depois do lock serializa duas entregas da mesma mensagem, como acontece com a idempotency key.
+- **Trade-offs / limitações:** o use case passa a conhecer o conceito de inbox (que é do domínio). A violação da PK do inbox fica sem tradução: com o lock, ela só ocorre se o mesmo `messageId` apontar para wallets diferentes; o erro é tratado como transitório e, na próxima tentativa, a consulta encontra o hash diferente e a mensagem vai para a DLQ.
+
+**`InboxMessageConflictError` fora da taxonomia:** é um erro interno, como o `DuplicateIdempotencyKeyError`, e não um `FailureCode`. Ele nunca chega à API (o HTTP não usa inbox) nem é gravado; só o consumidor o trata. Como `FailureCode`, exigiria um status HTTP que nunca é usado e uma migration (o `wager_transaction_failure_code_check` lista o enum inteiro) para um valor que nunca aparece numa linha.
+
+### 12.2 Consumidor
+
+- **Decisão:** loop de polling próprio com `@aws-sdk/client-sqs` (`WagerTransactionsConsumer`): long poll de 20 s, **uma mensagem por vez** (`MaxNumberOfMessages = 1`), pedindo `ApproximateReceiveCount` e `MessageGroupId`. O comando é montado com a mesma validação da API (`src/infrastructure/validation/`), e o `correlationId` é o `messageId` do envelope. O `consumerName` é `wager-transactions-consumer`.
+- **Alternativas consideradas:**
+  - a lib `sqs-consumer`;
+  - lotes de até 10 mensagens, processados em sequência, em paralelo, ou em paralelo entre grupos e em sequência dentro de cada grupo.
+- **Por que escolhi:**
+  - A lib tira o loop e o shutdown, mas não a parte difícil: classificar erros, enviar para a DLQ e calcular o backoff por mensagem continuariam sendo chamadas diretas ao `SQSClient`. Além disso, ela declara que FIFO não é testado oficialmente.
+  - Com lote, uma falha transitória obrigaria a devolver as mensagens seguintes do mesmo grupo (para não quebrar a ordem), e cada devolução conta como recebimento delas: uma mensagem poderia ir para a DLQ por causa das falhas de outra. Com uma por vez, o FIFO não entrega a próxima do grupo enquanto a anterior estiver pendente, e cada mensagem só conta as próprias tentativas.
+- **Trade-offs / limitações:** uma chamada `ReceiveMessage` por mensagem. A vazão vem do número de instâncias.
+
+**`MessageGroupId`:** a convenção adotada (testes, README) é o `walletId`. A ordem do FIFO fica por wallet, o mesmo escopo do lock, e um retry segura só as mensagens da mesma wallet. A ordem é uma conveniência, não uma garantia de correção (restrição 3): mensagens fora de ordem são tratadas por `PENDING_REFERENCE`.
+
+**Ligado por configuração:** `SQS_CONSUMER_ENABLED` (padrão `true`). Permite separar instâncias só de API e só de worker, e é desligado nos testes que não são de fila.
+
+### 12.3 Classificação de erros e ack
+
+- **Decisão:** a mensagem só recebe ack quando algo ficou gravado no banco. O que é terminal e não deixou registro vai para a DLQ.
+
+  | Situação | Ação |
+  |---|---|
+  | `PROCESSED`, `REJECTED`, `PENDING_REFERENCE`, replay, redelivery | ack (`DeleteMessage`) depois do commit |
+  | Corpo que não é JSON, envelope ou `data` inválidos, `OPENING`, valor monetário inválido | DLQ imediata |
+  | `IDEMPOTENCY_CONFLICT`, `EXTERNAL_TRANSACTION_CONFLICT`, `WALLET_NOT_FOUND`, `InboxMessageConflictError` | DLQ imediata |
+  | `TEMPORARILY_UNAVAILABLE` (lock timeout, deadlock, banco fora) | retry com backoff |
+  | Erro inesperado | retry com backoff; esgotado, DLQ pela redrive policy |
+
+  Na prática: todo `DomainError` que não é `TEMPORARILY_UNAVAILABLE` é determinístico e vai para a DLQ; o restante é tratado como transitório.
+- **Alternativas consideradas:** ack com log para payload inválido e conflitos (o case chama erros de negócio de "terminal, ack"); erro inesperado direto para a DLQ.
+- **Por que escolhi:**
+  - Toda mensagem termina registrada no banco ou na DLQ, nunca só no log. Os erros de negócio do case são as rejeições (`REJECTED`), que recebem ack. Payload inválido e conflitos são inconsistências do produtor: um ack apagaria a única cópia.
+  - Um erro inesperado pode ser uma falha de conexão não reconhecida. Tratá-lo como transitório custa no máximo as tentativas restantes antes da DLQ.
+- **Trade-offs / limitações:** um bug determinístico consome todas as tentativas antes de chegar à DLQ.
+
+### 12.4 Retry com backoff
+
+- **Decisão:** em erro transitório, a mensagem não recebe ack e tem a visibilidade alterada (`ChangeMessageVisibility`) para `computeBackoffDelay(ApproximateReceiveCount, 1 s, 60 s)`, a mesma função do outbox, arredondada para cima em segundos. O visibility timeout da fila (30 s) é o fallback se o processo morrer antes de ajustar a visibilidade.
+- **Alternativas consideradas:** só o visibility timeout fixo da fila (sem backoff); reenviar a mensagem para a fila com atraso.
+- **Por que escolhi:** filas FIFO não aceitam `DelaySeconds` por mensagem, e reenviar quebraria a ordem e a deduplicação. Alterar a visibilidade reaproveita o cálculo que já existe e mantém a mensagem no lugar dela no grupo.
+- **Trade-offs / limitações:** a precisão é de 1 s (a API só aceita segundos inteiros). Enquanto a mensagem espera, as seguintes da mesma wallet também esperam.
+
+### 12.5 DLQ e limite de tentativas
+
+- **Decisão:**
+  - Os erros da DLQ imediata são enviados pelo próprio consumidor: `SendMessage` na DLQ com o atributo `failureReason`, e depois `DeleteMessage`.
+  - Os transitórios que esgotam as tentativas vão para a DLQ pela `RedrivePolicy` da fila: `maxReceiveCount = 8`, configurado no `docker/localstack/init-sqs.sh`.
+- **Alternativas consideradas:** só a redrive policy (os erros permanentes esperariam 8 recebimentos); só o consumidor (ele teria que contar as tentativas, e não pegaria o processo que morre sempre na mesma mensagem).
+- **Por que escolhi:** cada caminho usa o mecanismo certo. Com backoff de 1, 2, 4… até 60 s, as 8 tentativas toleram cerca de 2 minutos de indisponibilidade do banco, o suficiente para um restart ou failover; depois disso, a mensagem parada na DLQ é melhor do que segurar a wallet por mais tempo. Uma mensagem na DLQ pode voltar para a fila principal (redrive) depois da correção.
+- **Trade-offs / limitações:** enviar para a DLQ e apagar não é atômico: se o processo morrer entre os dois passos, a DLQ recebe uma cópia e a mensagem é reprocessada, o que leva de novo à DLQ. Não há efeito financeiro.
+
+### 12.6 Encerramento (`SIGTERM`)
+
+- **Decisão:** no shutdown do Nest (`enableShutdownHooks` + `beforeApplicationShutdown`), o consumidor aborta o long poll, termina a mensagem em processamento (ack incluído) e, se uma mensagem chegar depois do pedido de parada, devolve com visibilidade 0. O encerramento espera no máximo 10 s.
+- **Alternativas consideradas:** só drenar (sem devolver); só devolver tudo o que foi recebido.
+- **Por que escolhi:** a mensagem em andamento está numa transação curta, então terminar custa milissegundos; uma mensagem que não começou volta para a fila na hora, em vez de esperar os 30 s de visibilidade. Os 10 s ficam abaixo dos 30 s que Docker e ECS esperam antes do `SIGKILL`.
+- **Trade-offs / limitações:** se o processo for morto no meio, a correção continua garantida pelo commit, pelo inbox e pela idempotency key; só a mensagem volta mais tarde.
 
 ## 13. Transactional Outbox
 
@@ -634,12 +702,36 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 - **Alternativas consideradas:** uma falha no próprio banco (trigger temporário barrando o insert no `outbox_message`), que exige DDL no teste e limpeza depois.
 - **Por que escolhi:** banco real, sem DDL no teste. A falha fica num ponto controlado, depois que transação, wallet e ledger foram gravados.
 - **Cenários:** depois da falha, nenhuma transação nem lançamento novo, saldo e `version` intactos, outbox inalterado. A mesma requisição reenviada é processada normalmente, porque não ficou registro parcial. A abertura de wallet que falha não deixa wallet, transação `OPENING`, lançamento nem evento.
-- **Trade-offs / limitações:** o inbox entra nesse teste na etapa 6, quando o consumidor passar a gravá-lo na mesma transação.
+- **Inbox:** a linha do inbox é gravada antes do outbox, então a consulta ao ledger também a envia ao banco; o teste confirma que ela é desfeita junto (`test/application/process-wager-transaction.atomicity.test.ts`).
+
+### 17.3 Mensageria
+
+- **Decisão:** três camadas.
+  - **Use case com inbox** (`test/application/process-wager-transaction.inbox.test.ts`): inbox gravado em cada desfecho, redelivery sem efeito novo, replay de mensagem nova gravando o próprio inbox, `messageId` com outro conteúdo recusado.
+  - **Consumidor** (`test/messaging/wager-transactions.consumer.test.ts`): o `WagerTransactionsConsumer` é instanciado direto, com LocalStack, PostgreSQL e use case reais. Cada teste cria filas FIFO temporárias (nome aleatório, `maxReceiveCount = 2`, visibilidade de 5 s) e as apaga no fim.
+  - **Aplicação** (`test/messaging/wager-transactions-consumer.e2e.test.ts`): o `AppModule` sobe com o consumidor ligado, apontando para filas temporárias, e uma mensagem publicada é processada de ponta a ponta; o `app.close()` encerra o consumidor.
+- **Alternativas consideradas:** usar as filas de desenvolvimento com os limites de produção; testar só pela aplicação.
+- **Por que escolhi:** com `maxReceiveCount = 8`, o teste de DLQ por redrive levaria cerca de 2 minutos. Filas próprias deixam os testes rápidos e isolados entre si e da fila de desenvolvimento. Instanciar o consumidor direto permite controlar `start`/`stop` e testar o shutdown sem derrubar a aplicação.
+- **Cenários do consumidor:**
+
+  | Cenário | Como é provocado |
+  |---|---|
+  | mensagem válida processada e apagada | envio normal |
+  | redelivery depois do commit e antes do ack | o use case processa a mensagem antes, como se o ack tivesse se perdido; depois ela é enviada |
+  | retry com backoff | o teste segura o lock da wallet (`lock_timeout` de 200 ms no use case) e solta depois da primeira falha |
+  | DLQ pela redrive policy | o lock fica retido durante todo o teste |
+  | DLQ imediata | corpo que não é JSON, `walletId` inválido, `OPENING`, valor inválido, wallet inexistente, `messageId` repetido com outro conteúdo |
+  | `stop()` durante o long poll | retorna em menos de 1 s |
+  | `stop()` com mensagem em processamento | ao retornar, a transação já está gravada e a mensagem, apagada |
+
+- **Como as rotas da DLQ são distinguidas:** a mensagem enviada pelo consumidor carrega o atributo `failureReason`; a movida pela redrive policy, não. Sem essa verificação, os testes de DLQ imediata passariam mesmo que o consumidor tratasse tudo como transitório, porque a redrive acabaria levando a mensagem para a DLQ depois de 2 recebimentos.
+- **Prova de que os testes detectam o erro:** três mutações no consumidor, cada uma pega pelos testes correspondentes: nada enviado direto para a DLQ (6 falhas), erro transitório recebendo ack em vez de retry (2), `stop()` sem esperar a mensagem em andamento (1).
+- **Determinismo:** sem `sleep`; os testes esperam por condição (`test/support/eventually.ts`). O consumidor fica desligado nos demais testes por um `preload` do `bun test` (`test/setup.ts`), que define `SQS_CONSUMER_ENABLED=false` quando a variável não está definida.
 
 ## 18. Trade-offs e limitações conhecidas
 
 - **Ordem do histórico depende do relógio das instâncias.** O `created_at` do lançamento vem do relógio da instância que o gravou. O lock garante a ordem real das alterações, mas com relógios desalinhados entre instâncias o histórico ordenado por `(created_at, id)` pode mostrar dois lançamentos invertidos, e o desempate dentro do mesmo milissegundo é pelo id. A soma do ledger, e portanto a reconciliação, não é afetada; uma auditoria encadeada (`balance_before` de cada lançamento = `balance_after` do anterior) é. Alternativa descartada: coluna de versão no ledger (seção 9.6).
-- **A API ainda não grava `FAILED`.** Um erro inesperado responde 500 `PROCESSING_FAILED` sem gravar a transação, e o reenvio com a mesma key tenta de novo. Classificar quais erros são permanentes e gravá-los como `FAILED` fica para a etapa 6, onde o consumidor SQS é o caso principal.
+- **O status `FAILED` existe no domínio, mas não é gravado.** Um erro inesperado não grava a transação: pela API responde 500 `PROCESSING_FAILED`, e pela fila a mensagem é tentada de novo até ir para a DLQ (seção 12.3). Gravar `FAILED` faria a mesma idempotency key devolver `FAILED` para sempre, e a correção do bug não reprocessaria a operação. Sem a gravação, o provedor reenvia pela API e a mensagem volta da DLQ para a fila (redrive) depois da correção, sendo processada normalmente. O registro durável da falha é a DLQ (pela fila) e o log (pela API).
 - **Reversão de transação ainda pendente.** Uma reversão que chega enquanto a transação referenciada está em `PENDING_REFERENCE` é rejeitada com `REFERENCE_NOT_PROCESSED`, em vez de aguardar a resolução da referência. Encadear pendências não é exigido pelo case e adicionaria complexidade ao worker; o caso é raro (exige duas operações fora de ordem em sequência).
 
 ## 19. Uso de IA

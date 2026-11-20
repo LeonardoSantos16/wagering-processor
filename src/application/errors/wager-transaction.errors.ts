@@ -16,3 +16,10 @@ export class IdempotencyConflictError extends DomainError {
     super('idempotency key already used with a different payload');
   }
 }
+
+export class InboxMessageConflictError extends Error {
+  constructor(messageId: string) {
+    super(`message ${messageId} already received with a different payload`);
+    this.name = 'InboxMessageConflictError';
+  }
+}
