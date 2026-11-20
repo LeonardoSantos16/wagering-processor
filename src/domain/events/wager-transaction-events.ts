@@ -27,7 +27,7 @@ export interface WagerTransactionProcessedData extends WagerTransactionEventData
 
 export interface WagerTransactionRejectedData extends WagerTransactionEventData {
   failureCode: FailureCode;
-  balanceAfter: MoneyProps;
+  balanceAfter?: MoneyProps;
   /** ISO-8601 */
   rejectedAt: string;
 }
@@ -77,7 +77,7 @@ export class WagerTransactionRejected extends IntegrationEvent<WagerTransactionR
       data: {
         ...baseData(tx),
         failureCode: required(tx.failureCode, 'failureCode'),
-        balanceAfter: required(tx.balanceAfter, 'balanceAfter').toJSON(),
+        ...(tx.balanceAfter !== undefined && { balanceAfter: tx.balanceAfter.toJSON() }),
         rejectedAt: required(tx.resolvedAt, 'resolvedAt').toISOString(),
       },
     });

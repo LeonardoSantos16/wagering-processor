@@ -1,0 +1,41 @@
+import type { EntityManager } from '@mikro-orm/postgresql';
+import type { WagerTransactionRepository } from '../../../application/ports/wager-transaction.repository';
+import type { WagerTransaction } from '../../../domain/wagering/wager-transaction';
+import { WagerTransactionRecord } from './wager-transaction.entity';
+import { WagerTransactionMapper } from './wager-transaction.mapper';
+
+export class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
+  constructor(private readonly em: EntityManager) {}
+
+  findById(id: string): Promise<WagerTransaction | null> {
+    return this.findOne({ id });
+  }
+
+  findByIdempotencyKey(providerId: string, idempotencyKey: string): Promise<WagerTransaction | null> {
+    return this.findOne({ providerId, idempotencyKey });
+  }
+
+  findByExternalId(
+    providerId: string,
+    externalTransactionId: string,
+  ): Promise<WagerTransaction | null> {
+    return this.findOne({ providerId, externalTransactionId });
+  }
+
+  async save(transaction: WagerTransaction): Promise<void> {
+    const data = WagerTransactionMapper.toRecord(transaction);
+    const managed = this.em.getUnitOfWork().getById(WagerTransactionRecord, transaction.id);
+    if (managed) {
+      this.em.assign(managed, data);
+    } else {
+      this.em.create(WagerTransactionRecord, data);
+    }
+  }
+
+  private async findOne(
+    where: Partial<Pick<WagerTransactionRecord, 'id' | 'providerId' | 'idempotencyKey' | 'externalTransactionId'>>,
+  ): Promise<WagerTransaction | null> {
+    const record = await this.em.findOne(WagerTransactionRecord, where);
+    return record ? WagerTransactionMapper.toDomain(record) : null;
+  }
+}

@@ -168,6 +168,7 @@ export class WagerTransaction {
     if (!hasReference && props.referenceTransactionId) {
       throw new InvariantViolationError('a transaction without a reference cannot record one');
     }
+    this.assertBalanceCurrency(props.balanceAfter);
 
     this._status = WagerTransactionStatus.Processed;
     this._referenceTransactionId = props.referenceTransactionId;
@@ -179,6 +180,15 @@ export class WagerTransaction {
   /** PENDING | PENDING_REFERENCE -> REJECTED. */
   reject(props: RejectProps): void {
     this.assertResolvable('reject');
+    if (props.code === FailureCode.CurrencyMismatch) {
+      if (props.balanceAfter !== undefined) {
+        throw new InvariantViolationError('a CURRENCY_MISMATCH rejection cannot record a balance');
+      }
+    } else if (props.balanceAfter === undefined) {
+      throw new InvariantViolationError('a rejection must record the observed balance');
+    } else {
+      this.assertBalanceCurrency(props.balanceAfter);
+    }
     this._status = WagerTransactionStatus.Rejected;
     this._failureCode = props.code;
     this._balanceAfter = props.balanceAfter;
@@ -210,6 +220,12 @@ export class WagerTransaction {
     }
     this._referenceAttempts += 1;
     this._nextReferenceAttemptAt = nextAttemptAt;
+  }
+
+  private assertBalanceCurrency(balance: Money): void {
+    if (balance.currency !== this.money.currency) {
+      throw new InvariantViolationError('balanceAfter must be in the transaction currency');
+    }
   }
 
   private assertResolvable(action: string): void {
