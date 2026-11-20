@@ -28,5 +28,7 @@ export default defineConfig({
     glob: '!(*.d).ts',
     transactional: true,
     snapshotOnMigrate: false,
+    // Fixed name: the snapshot describes the schema, not a particular database.
+    snapshotName: '.snapshot-wagering',
   },
 });
