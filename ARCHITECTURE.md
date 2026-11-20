@@ -62,7 +62,8 @@ src/
                    WalletLedgerEntry, Inbox/Outbox, eventos de integração, erros de domínio
   application/     use cases (orquestram uma transação SQL), portas
                    (interfaces de repositórios, publisher, relógio etc.) e
-                   services (regras compartilhadas entre use cases)
+                   services (regras compartilhadas entre use cases) e
+                   queries (leituras sem efeito, num snapshot só)
   infrastructure/  adaptadores: persistence (MikroORM), messaging (SQS),
                    http (controllers, health, auth), validation (schemas
                    compartilhados por HTTP e fila), workers (loops de
@@ -306,7 +307,7 @@ Não há FK de `player_id` nem de `currency` para a wallet: `PLAYER_WALLET_MISMA
 **Índices de consulta:** cada um atende a uma consulta que existe.
 - `wager_transaction_wallet_id_index`: consultas por wallet.
 - `wager_transaction_pending_reference_index`: parcial, só com as linhas em `PENDING_REFERENCE`, para o worker de reprocessamento.
-- `wallet_ledger_entry_wallet_created_at_index`: histórico, reconciliação e replay.
+- `wallet_ledger_entry_wallet_created_at_id_index`: histórico paginado (cursor por `(created_at, id)`, seção 11.3), reconciliação e replay. Substituiu o `wallet_ledger_entry_wallet_created_at_index` na etapa 9: sem o `id`, o desempate do cursor dentro do mesmo milissegundo não vinha do índice.
 - `outbox_message_pending_index`: parcial, só com as mensagens não publicadas, para o publisher.
 
 As buscas por idempotency key e por id externo usam os índices dos próprios `UNIQUE`.
@@ -448,6 +449,8 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 
 **`POST /wallets`:** 201 na criação.
 
+**Consultas e reconciliação** (seções 11.3 e 15): 200 quando o recurso existe, inclusive na reconciliação divergente (`consistent: false`), porque a verificação funcionou e a divergência é o resultado dela. Recurso da URL inexistente: 404 (`WALLET_NOT_FOUND` ou `TRANSACTION_NOT_FOUND`). Id que não é UUID, `limit` fora da faixa ou cursor inválido: 400 `INVALID_PAYLOAD`, com o campo em `details`.
+
 **Erros sem gravação:** o status vem da categoria do `failureCode` (seção 11.2): 400 para payload inválido, 409 para conflito, 422 para `WALLET_NOT_FOUND` citada no corpo (404 quando o recurso é o da URL), 503 para falha transitória e 500 para erro inesperado.
 
 **Formatos de corpo:**
@@ -507,6 +510,28 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 | `AMOUNT_MISMATCH` | Valor da reversão diferente do valor da referência |
 | `TEMPORARILY_UNAVAILABLE` | Banco ou fila indisponível, ou timeout de lock |
 | `PROCESSING_FAILED` | Erro permanente de infraestrutura; transação gravada como `FAILED` |
+
+### 11.3 Consultas
+
+**Paginação do ledger (`GET /wallets/:walletId/ledger?cursor=&limit=`):**
+- **Decisão:** keyset por `(created_at, id)`, do lançamento mais recente para o mais antigo. A página seguinte é `(created_at, id) < (cursor)`, com o `id` desempatando o mesmo milissegundo, e o índice passou a ser `(wallet_id, created_at, id)` (seção 8.2). O cursor é o base64url de `{"c": createdAt ISO, "i": id}` do último item da página, sem assinatura. `limit` padrão 50, aceito de 1 a 100. A busca pede `limit + 1` linhas: se vier a linha extra, a resposta traz `nextCursor`; se não, `nextCursor: null`. Corpo: `{ items: [{ id, transactionId, direction, amount, balanceBefore, balanceAfter, createdAt }], nextCursor }`.
+- **Alternativas consideradas:**
+  - offset (`?page=`), escondido ou não num cursor: lançamentos novos deslocam as páginas, e um item se repete ou some (o case pede cursor estável);
+  - keyset só pelo `id` (UUIDv7, que carrega o tempo): consulta mais simples, mas os ids de instâncias diferentes não são monotônicos entre si, e a ordem deixaria de ser a do `created_at` que o resto do sistema usa;
+  - do mais antigo para o mais recente;
+  - cursor assinado (HMAC), ou `limit` acima do máximo reduzido em silêncio.
+- **Por que escolhi:** o keyset é estável: cada página começa estritamente depois do último item visto, então um lançamento novo não desloca as seguintes. Do mais recente primeiro é o uso de um extrato, e os lançamentos novos entram antes da primeira página, nunca no meio da paginação. Assinar o cursor não protege nada: quem o altera só pagina errado a própria wallet, que já vem da URL. Um `limit` inválido responde 400, coerente com não colapsar erros (seção 11.1).
+- **Trade-offs / limitações:** a ordem depende do relógio das instâncias (seção 18). O cursor é opaco por convenção, não por criptografia; mudar o formato depois exige aceitar os dois por um tempo.
+
+**Wallet e transações:**
+- `GET /wallets/:walletId` devolve o mesmo corpo do `POST /wallets` (`{ id, playerId, balance, version }`).
+- `GET /wagering/transactions/:transactionId` e `GET /providers/:providerId/wagering/transactions/:externalTransactionId` devolvem a mesma visão de consulta: `{ transactionId, providerId, externalTransactionId, roundId, gameId, walletId, playerId, kind, money, status, failureCode, referenceTransactionId, referenceExternalTransactionId, balance, createdAt, processedAt, resolvedAt }`, com `null` nos campos ausentes. Não é o corpo do `POST`: `idempotentReplay` não faz sentido numa consulta. Campos internos (`payloadHash`, `idempotencyKey`, `referenceAttempts`, `nextReferenceAttemptAt`) ficam de fora. A transação `OPENING`, sem provider, só aparece pela rota por id.
+
+**Onde ficam as leituras:**
+- **Decisão:** queries na camada de aplicação (`src/application/queries/`: `GetWalletQuery`, `ListWalletLedgerQuery`, `GetWagerTransactionQuery`), usando as portas de repositório, com um método novo `WalletLedgerRepository.findPage`. Rodam em `UnitOfWork.runReadOnly`: uma transação `REPEATABLE READ READ ONLY`, um snapshot só, sem lock e sem `lock_timeout`. Elas devolvem `null` quando o recurso não existe; o controller converte em `ResourceNotFoundError`, que responde 404. A distinção é necessária porque `WALLET_NOT_FOUND` citado no corpo de um `POST` responde 422 (seção 11.1).
+- **Alternativas consideradas:** controllers usando os repositórios direto; CQRS formal com read models próprios.
+- **Por que escolhi:** mantém a regra de dependência (seção 2) sem acrescentar camadas.
+- **Trade-offs / limitações:** as consultas leem as tabelas de escrita. Com volume alto, um read model separado aliviaria o banco principal.
 
 ## 12. Processamento por SQS
 
@@ -731,6 +756,29 @@ Vale para o publisher do outbox e para o worker de `PENDING_REFERENCE` (seção 
 
 ## 15. Reconciliação
 
+`POST /wallets/:walletId/reconciliation` compara o saldo gravado na wallet com o saldo reconstruído pelo ledger (`ReconcileWalletUseCase`).
+
+**Leitura consistente:**
+- **Decisão:** wallet e lançamentos são lidos na mesma transação `REPEATABLE READ READ ONLY` (`UnitOfWork.runReadOnly`).
+- **Alternativas consideradas:**
+  - `FOR SHARE` na wallet: espera quem está escrevendo e bloqueia novas escritas durante a leitura, podendo esbarrar no `lock_timeout` (503);
+  - uma query só, com o agregado do ledger: mesmo snapshot por ser um statement só, mas a soma sai do `Money` e vai para o SQL;
+  - duas leituras em `READ COMMITTED`, como no resto do sistema.
+- **Por que escolhi:** em `READ COMMITTED` cada statement vê um snapshot diferente, e um débito que comita entre a leitura da wallet e a do ledger aparece como divergência falsa. O snapshot único evita isso sem disputar o lock com o processamento. O teste concorrente da seção 17.6 falha quando o isolamento volta para `READ COMMITTED`.
+- **Trade-offs / limitações:** o resultado é o estado de um instante. Uma transação que comita logo depois não entra, o que é esperado de uma verificação pontual.
+
+**Cálculo:**
+- **Decisão:** `calculatedBalance` = Σ créditos − Σ débitos de todos os lançamentos da wallet, somados com `Money`; `difference` = `storedBalance − calculatedBalance` (negativa quando a wallet guarda menos que o ledger); `consistent` = diferença zero; `checkedEntries` = número de lançamentos. Uma wallet aberta com saldo zero não tem lançamentos e está consistente com zero.
+- **Alternativas consideradas:** `SUM` no SQL; verificar também o encadeamento (`balance_before` de cada lançamento = `balance_after` do anterior).
+- **Por que escolhi:** a soma com `Money` usa a mesma aritmética exata do domínio. O encadeamento depende da ordem do histórico, que depende do relógio das instâncias (seção 18), e daria falsos positivos.
+- **Trade-offs / limitações:** os lançamentos da wallet são carregados em memória (seção 18).
+
+**Divergência:**
+- **Decisão:** responde 200 com `consistent: false` e registra um log `error` (`wallet balance diverges from the ledger`) com `walletId`, os três saldos e `checkedEntries`. Nada é corrigido: o saldo gravado continua o mesmo. A reconciliação não grava nada, não publica evento e não exige `Idempotency-Key`, então chamá-la de novo é seguro.
+- **Alternativas consideradas:** 409 ou 500 para a divergência; gravar cada reconciliação numa tabela de auditoria.
+- **Por que escolhi:** 409 e 500 significam conflito e falha, e a verificação não falhou (seção 11.1). O log e a métrica já são o registro durável que o case pede.
+- **Trade-offs / limitações:** o contador de divergências entra na etapa 10, junto com a escolha da biblioteca de métricas (seção 16.3). Até lá a sinalização é a resposta e o log.
+
 ## 16. Observabilidade
 
 ### 16.1 Logs estruturados
@@ -893,6 +941,14 @@ Os testes que já existiam em processo único foram mantidos: eles já provam o 
 | busca da outbox sem `FOR UPDATE SKIP LOCKED` | falha `publisher-crash` (as linhas não estão presas pela instância morta) |
 | use case sem a busca pela idempotency key | falha `consumer-crash` (o redelivery não vira replay). O `restart-consistency` passa: o kill não pega nenhuma mensagem ou requisição no intervalo entre o commit e a resposta, que dura milissegundos, então não há replay a fazer. Esse ponto exato é o que o `consumer-crash` provoca |
 
+### 17.6 Consultas e reconciliação
+
+- **Repositório** (`test/persistence/wallet-ledger.repository.test.ts`): `findPage` com quatro lançamentos no mesmo `created_at` (desempate pelo `id`, sem pular nem repetir), cursor no meio de um empate, lançamento inserido entre uma página e a seguinte sem deslocá-la, e isolamento entre wallets.
+- **Use case** (`test/application/reconcile-wallet.use-case.test.ts`): wallet consistente; divergência forçada com `UPDATE wallet` direto no banco (a wallet aceita update, o ledger não), reportada e não corrigida; wallet sem lançamentos; wallet inexistente; e 20 reconciliações em paralelo com 20 `BET`, nenhuma acusando divergência.
+- **HTTP** (`test/http/queries.e2e.test.ts`): os cinco endpoints com 200, 400 e 404, a paginação até `nextCursor: null` e a reconciliação divergente pelo `AppModule`.
+- **Invariante:** o helper `expectBalanceMatchesLedger` também roda a reconciliação e exige `consistent: true`, então todo teste que mexe em saldo passa a exercitá-la.
+- **Prova de que os testes detectam o erro:** com o `runReadOnly` em `READ COMMITTED`, o teste das reconciliações em paralelo falhou nas 3 execuções (divergência falsa).
+
 ## 18. Trade-offs e limitações conhecidas
 
 - **Ordem do histórico depende do relógio das instâncias.** O `created_at` do lançamento vem do relógio da instância que o gravou. O lock garante a ordem real das alterações, mas com relógios desalinhados entre instâncias o histórico ordenado por `(created_at, id)` pode mostrar dois lançamentos invertidos, e o desempate dentro do mesmo milissegundo é pelo id. A soma do ledger, e portanto a reconciliação, não é afetada; uma auditoria encadeada (`balance_before` de cada lançamento = `balance_after` do anterior) é. Alternativa descartada: coluna de versão no ledger (seção 9.6).
@@ -901,6 +957,7 @@ Os testes que já existiam em processo único foram mantidos: eles já provam o 
 - **Referência que chega depois do prazo.** Depois do `REJECTED` com `REFERENCE_NOT_FOUND`, reenviar a mesma reversão devolve a rejeição pelo replay (regra 7), mesmo que a referência já exista. A reversão fica perdida até uma conciliação manual. O prazo de 1 h (seção 14) foi escolhido para tornar esse caso raro.
 - **Pendência que falha sempre fica na frente da fila.** Uma transação em `PENDING_REFERENCE` cuja tentativa falha sempre por um erro inesperado (um bug) não é reagendada, porque o erro desfaz a transação. Como a busca é ordenada pela próxima tentativa, ela volta em todo ciclo, e com 10 dessas as demais ficam travadas atrás. É improvável e aparece nos logs a cada ciclo. Tratar o caso exigiria gravar o erro numa transação separada. No publisher, falhas do SQS não têm esse problema: viram `scheduleRetry` com backoff (seção 13.3); só um erro do próprio banco deixaria o evento intocado.
 - **Publisher segura uma conexão durante a chamada ao SQS.** A reserva com `SKIP LOCKED` mantém a transação aberta enquanto o SQS responde (seção 13.3). Com o SQS lento, cada publisher ocupa uma conexão do pool por até 5 s por ciclo. O *lease*, com publicação fora da transação, resolveria isso com mais peças.
+- **Reconciliação carrega o ledger em memória.** Os lançamentos da wallet são lidos e somados com `Money` (seção 15). Uma wallet com milhões de lançamentos pesaria em memória e tempo de resposta. A saída seria um `SUM` no SQL (`numeric` é exato) ou saldos de fechamento periódicos com reconciliação incremental.
 - **Ordem dos eventos é melhor esforço.** Retries e grupos FIFO diferentes podem entregar eventos fora de ordem (seção 13.3); o consumidor precisa usar o `walletVersion` para descartar o que chegar atrasado.
 
 ## 19. Uso de IA
