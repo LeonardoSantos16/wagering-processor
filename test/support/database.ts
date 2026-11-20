@@ -20,3 +20,13 @@ export async function expectViolation(statement: Promise<unknown>, name: string)
   expect(error).toBeInstanceOf(Error);
   expect((error as Error).message).toContain(name);
 }
+
+export function insertRow(orm: MikroORM, table: string, row: Record<string, unknown>): Promise<unknown> {
+  const columns = Object.keys(row);
+  const placeholders = columns.map(() => '?').join(', ');
+  return rawSql(
+    orm,
+    `insert into ${table} (${columns.join(', ')}) values (${placeholders})`,
+    Object.values(row),
+  );
+}
