@@ -60,11 +60,13 @@ Antes de qualquer código de domínio, um spike validou que a stack funciona jun
 src/
   domain/          regras de negócio puras: Money, Wallet, WagerTransaction,
                    WalletLedgerEntry, Inbox/Outbox, eventos de integração, erros de domínio
-  application/     use cases (orquestram uma transação SQL) e portas
-                   (interfaces de repositórios, publisher, relógio etc.)
+  application/     use cases (orquestram uma transação SQL), portas
+                   (interfaces de repositórios, publisher, relógio etc.) e
+                   services (regras compartilhadas entre use cases)
   infrastructure/  adaptadores: persistence (MikroORM), messaging (SQS),
                    http (controllers, health, auth), validation (schemas
-                   compartilhados por HTTP e fila), config
+                   compartilhados por HTTP e fila), workers (loops de
+                   polling do publisher e do PENDING_REFERENCE), config
   main.ts, app.module.ts
 ```
 
@@ -297,9 +299,9 @@ Não há FK de `player_id` nem de `currency` para a wallet: `PLAYER_WALLET_MISMA
 | Transação existe | FK `transaction_id` |
 | Append-only | triggers que bloqueiam `UPDATE`, `DELETE` e `TRUNCATE` |
 
-**`outbox_message`:** chave primária `id` (= `eventId`, uma linha por evento), `payload` em `jsonb` (o JSON é validado na escrita), `attempts >= 0`, `event_type` não vazio.
+**`outbox_message`:** chave primária `id` (= `eventId`, uma linha por evento), `payload` em `jsonb` (o JSON é validado na escrita), `attempts >= 0`, `event_type` não vazio e mensagem publicada sem retry agendado (`published_at is null or next_attempt_at is null`, `outbox_message_published_without_next_attempt_check`), a mesma regra do `markPublished` no domínio.
 
-**`inbox_message`:** chave primária `(consumer_name, message_id)`, que é a deduplicação, e `CHECK` de formato do `payload_hash`.
+**`inbox_message`:** chave primária `(consumer_name, message_id)`, que é a deduplicação, `CHECK` de formato do `payload_hash`, e `consumer_name` e `message_id` não vazios.
 
 **Índices de consulta:** cada um atende a uma consulta que existe.
 - `wager_transaction_wallet_id_index`: consultas por wallet.
@@ -626,8 +628,8 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 **Retry com backoff exponencial:**
 - **Decisão:** `scheduleRetry(now)` incrementa `attempts` e agenda a próxima tentativa com backoff exponencial sem jitter: 1 s, 2 s, 4 s... até um teto de 60 s. O cálculo fica em uma função pura do domínio, `computeBackoffDelay(attempt, baseMs, maxMs)`, reaproveitada pelo worker de `PENDING_REFERENCE` (seção 14). Os valores são constantes no `OutboxMessage` e podem ser revistos junto com o publisher.
 - **Alternativas consideradas:** um objeto de política de backoff injetável; jitter (variação aleatória) no domínio.
-- **Por que escolhi:** mantém a assinatura do esqueleto do case (`scheduleRetry(now)`) com a fórmula em um único lugar. Sem jitter, o cálculo é determinístico e testável; se necessário, o jitter pode ser aplicado pelo publisher.
-- **Trade-offs / limitações:** sem jitter, várias instâncias que falharam ao mesmo tempo tentam de novo ao mesmo tempo.
+- **Por que escolhi:** mantém a assinatura do esqueleto do case (`scheduleRetry(now)`) com a fórmula em um único lugar. Sem jitter, o cálculo é determinístico e testável. O jitter ficou no intervalo de polling dos workers (seção 13.4).
+- **Trade-offs / limitações:** sem jitter por mensagem, eventos que falharam juntos são tentados de novo juntos. Com `SKIP LOCKED` (seção 13.3), cada evento é tentado por uma única instância, então isso não multiplica as chamadas ao SQS.
 
 **O outbox nunca desiste:**
 - **Decisão:** não há limite de tentativas; o atraso cresce até o teto e permanece nele.
@@ -635,14 +637,97 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 - **Por que escolhi:** o case exige não perder eventos confirmados; descartar após N tentativas seria exatamente isso. Uma indisponibilidade longa do SQS se resolve quando ele volta.
 - **Trade-offs / limitações:** um evento que nunca consegue ser publicado fica pendente indefinidamente. A métrica de *outbox lag* (idade do evento pendente mais antigo) é o alarme para esse caso.
 
-<!-- Publicação concorrente (múltiplos publishers), destino dos eventos e MessageGroupId: a definir na etapa 7. -->
+### 13.3 Publicação
+
+**Vários publishers sobre a mesma outbox:**
+- **Decisão:** o `PublishOutboxUseCase` faz tudo numa única transação: `SELECT … FOR UPDATE SKIP LOCKED` dos eventos pendentes e vencidos (mais antigos primeiro, até 10), publicação no SQS, `markPublished` ou `scheduleRetry` em cada um, e `COMMIT`. Toda instância roda o publisher; uma que encontra linhas travadas por outra as pula e pega as próximas.
+- **Alternativas consideradas:**
+  - *lease*: uma transação curta reserva as linhas (`next_attempt_at = now() + prazo`), a publicação acontece sem transação aberta e uma terceira etapa marca o resultado;
+  - um único publisher ativo por vez, eleito com `pg_try_advisory_lock`.
+- **Por que escolhi:** é o padrão mais comum de outbox no PostgreSQL, e o isolamento entre publishers vem do próprio banco, sem coluna de lease nem prazo para calibrar. A recuperação após crash é automática: se o processo morre, a conexão cai, o rollback solta os locks e outra instância assume as linhas (cenário da seção 11 do case). O líder único não teria publishers concorrentes de verdade, que é o que o case pede.
+- **Trade-offs / limitações:** a transação e uma conexão do pool ficam presas durante a chamada ao SQS. O custo é limitado pelo lote pequeno (10) e por um timeout de 5 s em cada chamada (`OUTBOX_PUBLISH_TIMEOUT_MS`). Se o processo morrer depois de publicar e antes do `COMMIT`, o evento é publicado de novo; o `MessageDeduplicationId` absorve a repetição dentro de 5 minutos, e fora disso o consumidor deduplica pelo `eventId`.
+
+**Resultado por evento:**
+- **Decisão:** a porta `EventPublisher` devolve a lista do que foi publicado e do que falhou. Só o que aparece como publicado recebe `markPublished`; qualquer outro evento, inclusive um que não apareça em nenhuma das listas, recebe `scheduleRetry`. Se o publisher lançar um erro, todos os eventos do lote vão para retry e a transação é confirmada assim mesmo.
+- **Alternativas consideradas:** tratar o lote como um todo (tudo publicado ou tudo em retry).
+- **Por que escolhi:** o `SendMessageBatch` pode aceitar parte das mensagens e recusar outras. Tratar o lote inteiro como falha republicaria o que já saiu. Na dúvida, o evento é considerado não publicado: publicar duas vezes é aceitável, perder um evento confirmado não. Confirmar a transação mesmo depois de um erro é o que grava o `attempts` e o backoff; sem isso, o mesmo evento seria tentado de novo a cada ciclo.
+- **Trade-offs / limitações:** nenhum além da duplicata já aceita.
+
+**Destino e formato da mensagem:**
+- **Decisão:** fila SQS FIFO `wagering-events.fifo` (`SQS_EVENTS_QUEUE_NAME`), sem DLQ e sem `ContentBasedDeduplication`, criada pelo `docker/localstack/init-sqs.sh`. Envio com `SendMessageBatch`. Cada mensagem tem:
+
+  | Campo | Valor |
+  |---|---|
+  | body | o envelope do evento (`payload` da outbox, isto é, o `event.toJSON()`) |
+  | `MessageGroupId` | o `aggregateId`: a transação nos eventos de transação, a wallet no `WalletBalanceChanged` |
+  | `MessageDeduplicationId` | o `eventId` |
+  | atributo `eventType` | o tipo do evento, para filtrar ou rotear sem desserializar o body |
+
+- **Alternativas consideradas:** fila SQS standard; tópico SNS com fila assinante; `SendMessage` um a um.
+- **Por que escolhi:** usa só a infraestrutura que já existe (o LocalStack sobe só com SQS) e dá ordem por agregado e deduplicação de graça dentro de 5 minutos. SNS seria mais realista para entregar a vários consumidores, mas nenhum requisito pede isso. A DLQ fica a cargo de quem consome a fila; aqui só publicamos. O dedup por conteúdo ficou desligado porque descartaria dois eventos diferentes que tivessem o mesmo corpo.
+- **Trade-offs / limitações:** a FIFO tem vazão menor por grupo que a standard, o que não pesa no volume do case.
+
+**Ordem é melhor esforço:**
+- **Decisão:** a ordem por agregado não é garantida. Um evento que falha e vai para retry é ultrapassado pelos seguintes do mesmo agregado, e eventos de agregados diferentes (por exemplo, o `WagerTransactionProcessed` e o `WalletBalanceChanged` da mesma operação) estão em grupos diferentes, sem ordem entre si.
+- **Alternativas consideradas:** ordem estrita, bloqueando o agregado inteiro enquanto um evento dele estiver em retry.
+- **Por que escolhi:** a ordem estrita exigiria uma consulta por agregado e travaria todos os eventos dele por causa de um. O consumidor consegue lidar com eventos fora de ordem: o `WalletBalanceChanged` traz `walletVersion`, e os eventos de transação trazem o status final.
+- **Trade-offs / limitações:** o consumidor precisa descartar o que chegar atrasado (um `walletVersion` menor que o último visto).
+
+**URL da fila resolvida na primeira publicação:**
+- **Decisão:** o `SqsEventPublisher` busca a URL da fila (`GetQueueUrl`) na primeira publicação e a guarda em cache, em vez de buscá-la no bootstrap como o consumidor (seção 12.2).
+- **Por que escolhi:** com a fila de eventos fora do ar, a aplicação continua subindo e processando transações; a falha vira retry na outbox. É o mesmo motivo do readiness não verificar essa fila (seção 16.2).
+
+### 13.4 Loops de polling dos workers
+
+Vale para o publisher do outbox e para o worker de `PENDING_REFERENCE` (seção 14), que compartilham o `PollingLoop` (`src/infrastructure/workers/polling-loop.ts`).
+
+- **Decisão:** loop próprio. A cada ciclo, o worker processa um lote de até 10 itens.
+  - Se o lote veio cheio e sem erro, o próximo ciclo roda na hora; caso contrário, o loop espera o intervalo (1 s) com jitter de ±20%.
+  - Cada item é isolado: um erro é logado e não interrompe os demais. Um ciclo com qualquer erro espera o intervalo, mesmo com o lote cheio.
+  - No `SIGTERM`, o loop para de buscar e termina o lote em andamento, até 10 s.
+  - Uma flag por worker (`OUTBOX_PUBLISHER_ENABLED`, `PENDING_REFERENCE_WORKER_ENABLED`). Intervalo e lote são configuráveis (`OUTBOX_POLL_INTERVAL_MS`, `OUTBOX_BATCH_SIZE`, `PENDING_REFERENCE_POLL_INTERVAL_MS`, `PENDING_REFERENCE_BATCH_SIZE`).
+- **Alternativas consideradas:** `@nestjs/schedule` com `@Interval`.
+- **Por que escolhi:** mesmo modelo do consumidor SQS (seção 12.2). O `@Interval` dispara mesmo que o ciclo anterior não tenha terminado, o que permitiria execuções sobrepostas na mesma instância, e não espera o lote em andamento no shutdown. O jitter no intervalo evita que instâncias que sobem juntas consultem o banco em sincronia; no backoff por item ele importa pouco, porque cada item é tentado por uma única instância (seção 13.2). Esperar o intervalo depois de um erro evita que um lote cheio de falhas vire um loop sem pausa contra o banco ou o SQS.
+- **Trade-offs / limitações:** ver o item que falha sempre (seção 18).
 
 ## 14. Referências fora de ordem (`PENDING_REFERENCE`)
 
-- **Primeira tentativa:** uma transação cuja referência não existe é gravada em `PENDING_REFERENCE`, sem saldo e sem tocar a wallet, com o evento `WagerTransactionPendingReference`. A primeira nova tentativa fica marcada para `now + computeBackoffDelay(1, 1 s, 60 s)`, com a mesma função e os mesmos valores do outbox (seção 13.2), em constantes do use case.
+- **Primeira tentativa:** uma transação cuja referência não existe é gravada em `PENDING_REFERENCE`, sem saldo e sem tocar a wallet, com o evento `WagerTransactionPendingReference`. A primeira nova tentativa fica marcada para 1 s depois.
 - O replay de uma transação pendente devolve o estado atual (202), como descrito na seção 6.2.
 
-<!-- Worker, tentativas seguintes, limite/TTL e desfecho: a definir na etapa 7. -->
+**Prazo (TTL):**
+- **Decisão:** a transação espera a referência por até **1 hora a partir do `createdAt`** (`PENDING_REFERENCE_TTL_MS`). O `referenceAttempts` continua sendo contado, para log e métricas, mas não define o limite.
+- **Alternativas consideradas:** limite por número de tentativas; prazos mais curtos (minutos) ou mais longos (24 h).
+- **Por que escolhi:** um prazo é o contrato fácil de explicar ao provedor ("esperamos a referência por até X") e não depende do ritmo do worker: se ele ficar parado, o prazo continua o mesmo. O valor de 1 h vem do nosso próprio pipeline: uma mensagem que falha chega à DLQ em poucos minutos (8 recebimentos, seção 12.5). Se a referência não chegou nesse tempo, só chega com intervenção (o provedor reenvia ou alguém faz o redrive da DLQ). Uma hora dá folga para isso sem deixar o provedor sem desfecho por um dia.
+- **Trade-offs / limitações:** é uma premissa revisável por provedor. Depois do prazo, a reversão fica perdida até uma conciliação manual (seção 18).
+
+**Tentativas e desfecho:**
+- **Decisão:** a cada tentativa, o worker procura a referência de novo:
+  - encontrada → as regras de negócio são aplicadas normalmente (`PROCESSED`, ou `REJECTED` por outra regra);
+  - ausente e prazo vencido → `REJECTED` com `REFERENCE_NOT_FOUND`, com o evento `WagerTransactionRejected`;
+  - ausente e prazo não vencido → `scheduleReferenceRetry`, sem evento (seção 13.1).
+
+  O intervalo entre tentativas usa o mesmo backoff do outbox (1 s, 2 s, 4 s… até 60 s, cerca de 65 tentativas em 1 h), e a próxima tentativa nunca passa do prazo: `min(now + backoff, createdAt + TTL)`.
+- **Alternativas consideradas:** rejeitar no vencimento sem uma última busca; teto de backoff maior (por exemplo, 5 min).
+- **Por que escolhi:** a última busca evita rejeitar uma referência que chegou no último instante. Limitar a próxima tentativa ao prazo faz a rejeição acontecer no prazo, e não até 60 s depois, o que deixa o TTL exato e fácil de testar. Cada tentativa é uma consulta indexada sob o lock da wallet, então um teto de 60 s é barato e encontra a referência mais cedo.
+- **Trade-offs / limitações:** nenhum relevante no volume esperado de pendências.
+
+**Onde fica cada parte:**
+- **Decisão:**
+  - O prazo e as próximas tentativas ficam na `PendingReferencePolicy` (`src/application/services/`), com o TTL vindo da config. O domínio recebe o `nextAttemptAt` pronto em `markPendingReference` e `scheduleReferenceRetry`.
+  - As regras de negócio (decidir, aplicar e gravar) saíram do `ProcessWagerTransactionUseCase` para o `WagerTransactionResolver` (`src/application/services/`), usado pelos dois use cases.
+  - O reprocessamento é o `ResolvePendingReferenceUseCase`, chamado pelo `PendingReferenceWorker`.
+- **Alternativas consideradas:** o domínio calcular o vencimento (`isReferenceExpired(now, ttl)`); o worker chamar o `ProcessWagerTransactionUseCase` existente.
+- **Por que escolhi:** o domínio protege as transições de estado, e a política de tempo é configuração da aplicação; assim o domínio não sabe de variáveis de ambiente. O use case existente nasce de um comando: cria a transação e trata idempotency key e inbox, que não existem no reprocessamento. Reaproveitá-lo exigiria flags e caminhos especiais. Com as regras extraídas, há uma única implementação delas.
+- **Trade-offs / limitações:** um service a mais na camada de aplicação.
+
+**Várias instâncias:**
+- **Decisão:** o worker busca os ids vencidos sem lock. Para cada um, abre uma transação, trava a wallet (`findByIdForUpdate`), relê a transação e só continua se ela ainda estiver em `PENDING_REFERENCE` e vencida; caso contrário, pula.
+- **Alternativas consideradas:** `FOR UPDATE SKIP LOCKED` nas linhas de `wager_transaction` antes de travar a wallet.
+- **Por que escolhi:** mantém uma ordem de lock única em todo o sistema (sempre a wallet primeiro, como no processamento normal, seção 9), então não surge risco de deadlock. Reler depois do lock é o mesmo padrão da idempotência (seção 9.4): duas instâncias que pegam a mesma transação se serializam na wallet, e a segunda a encontra já resolvida ou reagendada.
+- **Trade-offs / limitações:** instâncias podem disputar a mesma wallet à toa. A disputa é rara (pendências são poucas) e, no pior caso, esbarra no `lock_timeout` e a transação é tentada no próximo ciclo.
+
+**`correlationId` dos eventos do worker:** é o id da transação pendente. O `correlationId` da requisição original não é gravado, então não há como reaproveitá-lo; o id da transação liga o evento ao registro que o originou.
 
 ## 15. Reconciliação
 
@@ -666,6 +751,7 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 
 - `GET /health/live`: indica que o processo está de pé e respondendo. Não consulta dependências, para que uma falha no banco ou na fila não faça o orquestrador reiniciar o processo à toa.
 - `GET /health/ready`: verifica o PostgreSQL (`select 1`) e o SQS (`GetQueueUrl` da fila principal), cada um com timeout de 2 s. Responde 200 se ambos estiverem acessíveis e 503 caso contrário, indicando qual dependência falhou. O motivo da falha é registrado no log.
+- A fila de eventos (`wagering-events.fifo`) **não** entra no readiness. Com ela fora do ar, a instância continua processando transações, e os eventos se acumulam na outbox até a fila voltar (seção 13.3). Marcar a instância como não pronta derrubaria o tráfego HTTP por um problema que a outbox já absorve; o sinal para esse caso é a métrica de *outbox lag*.
 - Os dois são públicos (`@Public()`), como o case exige.
 
 ### 16.3 Métricas
@@ -726,13 +812,43 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 
 - **Como as rotas da DLQ são distinguidas:** a mensagem enviada pelo consumidor carrega o atributo `failureReason`; a movida pela redrive policy, não. Sem essa verificação, os testes de DLQ imediata passariam mesmo que o consumidor tratasse tudo como transitório, porque a redrive acabaria levando a mensagem para a DLQ depois de 2 recebimentos.
 - **Prova de que os testes detectam o erro:** três mutações no consumidor, cada uma pega pelos testes correspondentes: nada enviado direto para a DLQ (6 falhas), erro transitório recebendo ack em vez de retry (2), `stop()` sem esperar a mensagem em andamento (1).
-- **Determinismo:** sem `sleep`; os testes esperam por condição (`test/support/eventually.ts`). O consumidor fica desligado nos demais testes por um `preload` do `bun test` (`test/setup.ts`), que define `SQS_CONSUMER_ENABLED=false` quando a variável não está definida.
+- **Determinismo:** sem `sleep`; os testes esperam por condição (`test/support/eventually.ts`). O consumidor, o publisher do outbox e o worker de `PENDING_REFERENCE` ficam desligados nos demais testes por um `preload` do `bun test` (`test/setup.ts`), que define `SQS_CONSUMER_ENABLED`, `OUTBOX_PUBLISHER_ENABLED` e `PENDING_REFERENCE_WORKER_ENABLED` como `false` quando não estão definidas. Cada teste que precisa de um deles o liga explicitamente.
+
+### 17.4 Outbox e `PENDING_REFERENCE`
+
+- **Decisão:** as camadas são as mesmas da seção 17.3.
+  - **Use case de `PENDING_REFERENCE`** (`test/application/resolve-pending-reference.use-case.test.ts`): PostgreSQL real e relógio controlável, sem esperar o tempo passar.
+  - **Use case do publisher** (`test/application/publish-outbox.use-case.test.ts`): um **banco temporário próprio**, criado e migrado no início e apagado no fim (`createTemporaryDatabase`), e uma fila FIFO temporária por teste.
+  - **Aplicação** (`test/workers/out-of-order-reference.e2e.test.ts`): o `AppModule` sobe com os dois workers ligados e intervalos de 100 ms.
+  - **Unitários** do prazo (`PendingReferencePolicy`), dos workers e do `PollingLoop`.
+- **Alternativas consideradas:** rodar os testes do publisher no banco de desenvolvimento, limpando os eventos pendentes antes de cada teste; deixar o publisher esvaziar o acúmulo dentro do teste.
+- **Por que escolhi:** o banco de desenvolvimento acumula eventos não publicados de todas as execuções anteriores dos testes (milhares). Num banco próprio, a outbox só tem os eventos do teste, e dá para afirmar resultados exatos ("todos publicados, nenhum pendente") sem mexer nos dados de outros testes. Esvaziar o acúmulo teria duração imprevisível e crescente. O e2e não consegue trocar de banco com facilidade (o `AppModule` lê a configuração do banco na importação), então faz, como passo explícito, a marcação dos eventos pendentes antigos como publicados antes de subir a aplicação.
+- **Trade-offs / limitações:** criar e migrar o banco temporário acrescenta cerca de 1 s ao teste do publisher.
+- **Cenários de `PENDING_REFERENCE`:** a referência chega e a transação é processada; reagendamento com backoff, sem evento; próxima tentativa limitada ao prazo; vencimento resulta em `REFERENCE_NOT_FOUND` com o evento; última busca antes de rejeitar; referência encontrada mas rejeitada por outra regra; transação não vencida ou já resolvida é pulada; `findDue`; 10 resoluções em paralelo resultam em uma resolução, um lançamento e um evento.
+- **Cenários do publisher:**
+
+  | Cenário | O que é verificado |
+  |---|---|
+  | publicação | marca `publishedAt`; a mensagem na fila tem o envelope no body, `MessageGroupId = aggregateId`, `MessageDeduplicationId = eventId` e o atributo `eventType` |
+  | seleção | só pendentes e vencidos, mais antigos primeiro, até o limite |
+  | SQS inalcançável | fila inexistente; `attempts` e `nextAttemptAt` seguem o backoff |
+  | falha parcial | com um `EventPublisher` falso, só o evento recusado vai para retry |
+  | evento omitido no resultado | tratado como não publicado |
+  | 3 publishers em paralelo sobre 60 eventos | a soma do que cada um reservou é exatamente 60, nenhum fica pendente e os 60 chegam à fila |
+
+  O `EventPublisher` falso só é usado nos casos que o SQS não permite provocar de forma confiável; o banco é sempre real.
+- **Cenário da aplicação:** `ROLLBACK` antes da `BET`. O worker resolve a pendência, o saldo bate com o ledger e os eventos das duas transações chegam à fila. Os tipos são comparados sem ordem, porque os eventos de transação e o `WalletBalanceChanged` estão em grupos FIFO diferentes (seção 13.3).
+- **Prova de que o teste de concorrência detecta o erro:** sem o `FOR UPDATE SKIP LOCKED` na busca, os publishers reservam as mesmas linhas e o teste falha (numa execução, a soma chegou a 155 para 60 eventos).
 
 ## 18. Trade-offs e limitações conhecidas
 
 - **Ordem do histórico depende do relógio das instâncias.** O `created_at` do lançamento vem do relógio da instância que o gravou. O lock garante a ordem real das alterações, mas com relógios desalinhados entre instâncias o histórico ordenado por `(created_at, id)` pode mostrar dois lançamentos invertidos, e o desempate dentro do mesmo milissegundo é pelo id. A soma do ledger, e portanto a reconciliação, não é afetada; uma auditoria encadeada (`balance_before` de cada lançamento = `balance_after` do anterior) é. Alternativa descartada: coluna de versão no ledger (seção 9.6).
 - **O status `FAILED` existe no domínio, mas não é gravado.** Um erro inesperado não grava a transação: pela API responde 500 `PROCESSING_FAILED`, e pela fila a mensagem é tentada de novo até ir para a DLQ (seção 12.3). Gravar `FAILED` faria a mesma idempotency key devolver `FAILED` para sempre, e a correção do bug não reprocessaria a operação. Sem a gravação, o provedor reenvia pela API e a mensagem volta da DLQ para a fila (redrive) depois da correção, sendo processada normalmente. O registro durável da falha é a DLQ (pela fila) e o log (pela API).
 - **Reversão de transação ainda pendente.** Uma reversão que chega enquanto a transação referenciada está em `PENDING_REFERENCE` é rejeitada com `REFERENCE_NOT_PROCESSED`, em vez de aguardar a resolução da referência. Encadear pendências não é exigido pelo case e adicionaria complexidade ao worker; o caso é raro (exige duas operações fora de ordem em sequência).
+- **Referência que chega depois do prazo.** Depois do `REJECTED` com `REFERENCE_NOT_FOUND`, reenviar a mesma reversão devolve a rejeição pelo replay (regra 7), mesmo que a referência já exista. A reversão fica perdida até uma conciliação manual. O prazo de 1 h (seção 14) foi escolhido para tornar esse caso raro.
+- **Pendência que falha sempre fica na frente da fila.** Uma transação em `PENDING_REFERENCE` cuja tentativa falha sempre por um erro inesperado (um bug) não é reagendada, porque o erro desfaz a transação. Como a busca é ordenada pela próxima tentativa, ela volta em todo ciclo, e com 10 dessas as demais ficam travadas atrás. É improvável e aparece nos logs a cada ciclo. Tratar o caso exigiria gravar o erro numa transação separada. No publisher, falhas do SQS não têm esse problema: viram `scheduleRetry` com backoff (seção 13.3); só um erro do próprio banco deixaria o evento intocado.
+- **Publisher segura uma conexão durante a chamada ao SQS.** A reserva com `SKIP LOCKED` mantém a transação aberta enquanto o SQS responde (seção 13.3). Com o SQS lento, cada publisher ocupa uma conexão do pool por até 5 s por ciclo. O *lease*, com publicação fora da transação, resolveria isso com mais peças.
+- **Ordem dos eventos é melhor esforço.** Retries e grupos FIFO diferentes podem entregar eventos fora de ordem (seção 13.3); o consumidor precisa usar o `walletVersion` para descartar o que chegar atrasado.
 
 ## 19. Uso de IA
 
