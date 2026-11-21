@@ -10,7 +10,43 @@
 
 ## 1. Visão geral
 
-<!-- Resumo do sistema, principais componentes e fluxo HTTP/SQS → use case → banco → outbox → publicação. -->
+Serviço que processa transações de apostas de vários provedores, recebidas por HTTP (`POST /wagering/transactions`) e por SQS (`wager-transactions.fifo`). As duas entradas chamam o mesmo use case, que numa única transação SQL trava a wallet, verifica a idempotência (e o inbox, quando a origem é a fila), decide o resultado e grava a wallet, a transação, o lançamento no ledger, o inbox e os eventos na outbox. Depois do commit, um publisher envia os eventos para `wagering-events.fifo`. Transações que chegam antes da referência ficam em `PENDING_REFERENCE`, e um worker tenta resolvê-las depois. Todas as instâncias rodam as mesmas peças. A coordenação entre elas fica no PostgreSQL: lock da wallet, constraints únicas e `SKIP LOCKED`.
+
+```mermaid
+flowchart LR
+  provider[Provedor] -->|HTTP + Idempotency-Key| api[Controllers HTTP]
+  queue[(wager-transactions.fifo)] --> consumer[Consumidor SQS]
+  consumer -->|permanentes| dlq[(DLQ)]
+  queue -->|redrive após 8 recebimentos| dlq
+  api --> usecase[ProcessWagerTransactionUseCase]
+  consumer --> usecase
+  usecase --> tx
+
+  subgraph tx [Uma transação SQL, wallet travada com FOR UPDATE]
+    wallet[(wallet)]
+    transaction[(wager_transaction)]
+    ledger[(wallet_ledger_entry)]
+    inbox[(inbox_message)]
+    outbox[(outbox_message)]
+  end
+
+  worker[Worker de PENDING_REFERENCE] -->|tenta de novo| tx
+  outbox -->|SKIP LOCKED, após o commit| publisher[Publisher da outbox]
+  publisher --> events[(wagering-events.fifo)]
+```
+
+| Componente | Seção |
+|---|---|
+| `Money`, `Wallet`, `WagerTransaction`, ledger | 5, 6 |
+| Schema e garantias no banco | 8 |
+| Lock da wallet e ordem dos passos | 9 |
+| Idempotência e `payloadHash` | 10 |
+| API HTTP | 11 |
+| Consumidor SQS, inbox, retry e DLQ | 12 |
+| Outbox e publicação | 13 |
+| `PENDING_REFERENCE` | 14 |
+| Reconciliação | 15 |
+| Logs, health checks e métricas | 16 |
 
 ### 1.1 Stack e ferramentas
 
@@ -34,17 +70,17 @@ Antes de qualquer código de domínio, um spike validou que a stack funciona jun
 
 #### Configuração
 
-- **Decisão:** variáveis de ambiente lidas e validadas no boot por um loader tipado (`src/config/app-config.ts`), com valores padrão apontando para o ambiente local. Valor inválido ou ausente impede a aplicação de subir.
+- **Decisão:** variáveis de ambiente lidas e validadas no boot por um loader tipado (`src/infrastructure/config/app-config.ts`), com valores padrão apontando para o ambiente local. Valor inválido ou ausente impede a aplicação de subir.
 - **Alternativas consideradas:** `@nestjs/config`.
 - **Por que escolhi:** poucas variáveis; um loader simples evita uma dependência e mantém a configuração tipada.
 - **Trade-offs / limitações:** sem recursos como múltiplos arquivos `.env` por ambiente.
 
 #### Execução das migrations
 
-- **Decisão (provisória):** migrations rodam por comando separado (`bun run db:migrate`), não no boot da aplicação.
+- **Decisão:** migrations rodam por comando separado (`bun run db:migrate`), uma vez, antes de subir as instâncias, e nunca no boot da aplicação. Os testes de resiliência seguem o mesmo fluxo: migram o banco temporário e só depois sobem os processos (seção 17.5).
 - **Alternativas consideradas:** rodar as migrations automaticamente ao subir a aplicação.
 - **Por que escolhi:** com várias instâncias subindo ao mesmo tempo, todas tentariam migrar o banco simultaneamente.
-- **Trade-offs / limitações:** exige um passo a mais no setup. A decisão pode ser revista quando a forma de rodar múltiplas instâncias for definida.
+- **Trade-offs / limitações:** exige um passo a mais no setup. Num deploy real, o passo vira um job que roda antes da nova versão.
 
 ## 2. Estrutura do código e boundaries
 
@@ -97,11 +133,16 @@ Ficaram fora do escopo, por decisão, para concentrar o prazo nas áreas que mai
 - **Trade-offs / limitações:** a API fica aberta.
 
 **Ponto de extensão no código:**
-- `AuthGuard` (`src/auth/auth.guard.ts`), registrado como guard global: hoje libera todas as requisições. Uma implementação real validaria aqui o token emitido pelo IdP.
-- Decorator `@Public()` (`src/auth/public.decorator.ts`): marca rotas que não exigem autenticação. Já aplicado aos health checks, que o case exige abertos.
+- `AuthGuard` (`src/infrastructure/http/auth/auth.guard.ts`), registrado como guard global: hoje libera todas as requisições. Uma implementação real validaria aqui o token emitido pelo IdP.
+- Decorator `@Public()` (`src/infrastructure/http/auth/public.decorator.ts`): marca rotas que não exigem autenticação. Já aplicado aos health checks, que o case exige abertos, e ao `/metrics`.
 - Mensagens da fila são tratadas como canal interno confiável, mas a identidade do provedor contida na mensagem continua sujeita às validações de domínio.
 
-<!-- Desenho que seria adotado com um IdP externo: a definir. -->
+**Desenho que seria adotado:**
+- **IdP:** Keycloak, via OIDC, num container do Docker Compose. Cada provedor de jogos é um *client* confidencial e se autentica por **client credentials**, um fluxo máquina a máquina sem usuário. O token é um JWT curto, com uma claim `provider_id`.
+- **Validação:** o `AuthGuard` lê `Authorization: Bearer <jwt>` e valida a assinatura pelo JWKS do Keycloak (chaves em cache, recarregadas quando aparece um `kid` novo), além de `iss`, `aud` e `exp`. Sem token ou com token inválido, a resposta é 401. A identidade autenticada vai para a requisição por uma porta (`ProviderIdentity`), sem o controller conhecer JWT.
+- **Vínculo com o `providerId`:** um `providerId` no corpo diferente do token responde **403**. As consultas por provedor (`/providers/:providerId/...`) só aceitam o próprio provedor. As de wallet e transação por id exigiriam uma regra de posse que o case não define, e ficariam restritas a um papel de operação.
+- **Fora da autenticação:** health checks e `/metrics` continuam abertos. A fila continua sendo canal interno confiável, como o case define, e o `providerId` da mensagem passa pelas mesmas validações de domínio.
+- **Alternativa considerada:** Zitadel, que atende igual. O Keycloak foi escolhido por ser o mais conhecido.
 
 ## 5. Money
 
@@ -126,10 +167,10 @@ Ficaram fora do escopo, por decisão, para concentrar o prazo nas áreas que mai
 
 ### 6.1 Transições de status de `WagerTransaction`
 
-- **Decisão:** `PENDING` existe apenas em memória. A transação nasce `PENDING` no `create` e é resolvida dentro da mesma transação SQL; no banco só aparecem `PROCESSED`, `REJECTED`, `PENDING_REFERENCE` e `FAILED`.
+- **Decisão:** `PENDING` existe apenas em memória. A transação nasce `PENDING` no `create` e é resolvida dentro da mesma transação SQL; no banco só aparecem `PROCESSED`, `REJECTED` e `PENDING_REFERENCE` (`FAILED` existe no domínio, mas não é gravado; ver abaixo).
 - **Alternativas consideradas:** gravar `PENDING` primeiro e processar em uma segunda transação SQL.
 - **Por que escolhi:** HTTP e SQS executam o mesmo use case de forma síncrona, então não há trabalho "aceito para depois" além do `PENDING_REFERENCE`. Gravar `PENDING` criaria um estado intermediário que poderia ficar preso se o processo morresse entre as duas transações, exigindo um mecanismo extra de recuperação.
-- **Trade-offs / limitações:** não há registro de transações que falharam por erro transitório antes do commit; elas simplesmente não existem até uma nova tentativa ter sucesso (ver `FAILED` abaixo para erros permanentes).
+- **Trade-offs / limitações:** não há registro de transações que falharam por erro transitório antes do commit; elas simplesmente não existem até uma nova tentativa ter sucesso. O mesmo vale para erros inesperados (ver `FAILED` abaixo).
 
 ```mermaid
 stateDiagram-v2
@@ -151,7 +192,7 @@ stateDiagram-v2
 |---|---|---|---|---|
 | `PENDING` ou `PENDING_REFERENCE` | `PROCESSED` | `markProcessed(referenceTransactionId?, balanceAfter, at)` | Todas as regras de negócio passaram | `processedAt`, `resolvedAt`, `balanceAfter`, `referenceTransactionId` (quando há referência) |
 | `PENDING` ou `PENDING_REFERENCE` | `REJECTED` | `reject(code, balanceAfter, at)` | Regra de negócio violada, ou tentativas de resolver a referência esgotadas | `failureCode`, `resolvedAt`, `balanceAfter` |
-| `PENDING` ou `PENDING_REFERENCE` | `FAILED` | `fail(code, at)` | Erro permanente de infraestrutura (ver abaixo) | `failureCode`, `resolvedAt` |
+| `PENDING` ou `PENDING_REFERENCE` | `FAILED` | `fail(code, at)` | Erro permanente de infraestrutura; transição existe no domínio, mas não é usada nesta versão (ver abaixo) | `failureCode`, `resolvedAt` |
 | `PENDING` | `PENDING_REFERENCE` | `markPendingReference(...)` | A referência informada não foi encontrada | Contador de tentativas e data da próxima tentativa |
 | `PENDING_REFERENCE` | (mesmo status) | `scheduleReferenceRetry(now)` | Nova tentativa do worker sem encontrar a referência | Incrementa o contador e recalcula a próxima tentativa |
 
@@ -168,10 +209,10 @@ stateDiagram-v2
 - Tentativas de resolução da referência (contador e próxima tentativa): ficam na própria transação, sem tabela separada. Limite e backoff: ver seção 14.
 
 **Quando uma transação vira `FAILED`:**
-- **Decisão:** apenas quando o erro é classificado como permanente (não é de negócio e uma nova tentativa não resolveria) ou, na entrada por SQS, na última tentativa antes da DLQ. Como a transação SQL do processamento sofreu rollback, o `FAILED` é gravado em uma transação SQL separada.
-- **Alternativas consideradas:** nunca gravar `FAILED` (deixando a DLQ como único registro); gravar `FAILED` em qualquer erro de infraestrutura.
-- **Por que escolhi:** dá ao status um uso real e auditável sem "queimar" transações por instabilidades passageiras, que são tratadas com retry (503 na API, redelivery no SQS).
-- **Trade-offs / limitações:** a transação `FAILED` mantém a idempotency key; repetir a mesma operação devolve `FAILED`, e o provedor precisa de uma nova key para tentar de novo.
+- **Decisão:** nunca, nesta versão. O status e a transição `fail` existem no domínio, mas um erro inesperado não grava a transação: a transação SQL sofre rollback, a API responde 500 `PROCESSING_FAILED`, e pela fila a mensagem é tentada de novo até ir para a DLQ (seção 12.3).
+- **Alternativas consideradas:** gravar `FAILED` numa transação SQL separada quando o erro é permanente ou na última tentativa antes da DLQ (o desenho inicial); gravar `FAILED` em qualquer erro de infraestrutura.
+- **Por que escolhi:** gravar `FAILED` faria a mesma idempotency key devolver `FAILED` para sempre, e a correção do bug não reprocessaria a operação. Sem a gravação, o provedor reenvia pela API e a mensagem volta da DLQ para a fila (redrive) depois da correção.
+- **Trade-offs / limitações:** o registro durável da falha é a DLQ (pela fila) e o log (pela API), não o banco (seção 18).
 
 ### 6.2 Interpretações adicionais das regras de negócio
 
@@ -199,7 +240,7 @@ stateDiagram-v2
 - **Decisão:** MikroORM.
 - **Alternativas consideradas:** TypeORM (aceito pelo case).
 - **Por que escolhi:** é o preferencial do case e oferece Unit of Work, Identity Map, `em.transactional()` e `LockMode` explícitos, recursos diretamente ligados às exigências de atomicidade e concorrência.
-- **Trade-offs / limitações:** <!-- a definir -->
+- **Trade-offs / limitações:** comunidade e material menores que os do TypeORM. Atrito com o Bun: o CLI de migrations precisa rodar com `bun --bun` (scripts `db:*`), e o diff de `CHECK` exige escrever a expressão como o Postgres a devolve (seção 8.4).
 
 ### 7.2 Mapeamento domínio × ORM
 
@@ -307,7 +348,7 @@ Não há FK de `player_id` nem de `currency` para a wallet: `PLAYER_WALLET_MISMA
 **Índices de consulta:** cada um atende a uma consulta que existe.
 - `wager_transaction_wallet_id_index`: consultas por wallet.
 - `wager_transaction_pending_reference_index`: parcial, só com as linhas em `PENDING_REFERENCE`, para o worker de reprocessamento.
-- `wallet_ledger_entry_wallet_created_at_id_index`: histórico paginado (cursor por `(created_at, id)`, seção 11.3), reconciliação e replay. Substituiu o `wallet_ledger_entry_wallet_created_at_index` na etapa 9: sem o `id`, o desempate do cursor dentro do mesmo milissegundo não vinha do índice.
+- `wallet_ledger_entry_wallet_created_at_id_index`: histórico paginado (cursor por `(created_at, id)`, seção 11.3), reconciliação e replay. Substituiu o índice anterior, `wallet_ledger_entry_wallet_created_at_index`: sem o `id`, o desempate do cursor dentro do mesmo milissegundo não vinha do índice.
 - `outbox_message_pending_index`: parcial, só com as mensagens não publicadas, para o publisher.
 
 As buscas por idempotency key e por id externo usam os índices dos próprios `UNIQUE`.
@@ -355,7 +396,7 @@ A migration gerada com `--initial` não inclui `down`, por isso não é usada: t
   - combinações das anteriores.
 - **Por que escolhi:**
   - Wallet de aposta é disputada: o mesmo jogador envia `BET`/`WIN` em sequência rápida, e a fila reprocessa mensagens. Com lock otimista, isso viraria uma sequência de conflitos e de 503 quando as tentativas acabassem; com o lock, as requisições esperam em fila e nenhuma precisa ser refeita.
-  - A regra de saldo continua no domínio, testada na etapa 2. No update atômico ela iria para o SQL, e as outras validações (referência, reversão) ainda precisariam de uma leitura consistente.
+  - A regra de saldo continua no domínio, coberta pelos testes de unidade da `Wallet`. No update atômico ela iria para o SQL, e as outras validações (referência, reversão) ainda precisariam de uma leitura consistente.
   - O mesmo lock serializa os outros conflitos da mesma wallet: duas requisições com a mesma idempotency key e duas reversões da mesma referência (que, quando válida, está sempre na mesma wallet, regra 2). A segunda sempre encontra a primeira já gravada.
   - Funciona com várias instâncias, porque o lock fica no PostgreSQL. É um lock por linha, não global (restrição 6): wallets diferentes não esperam umas pelas outras.
 - **Trade-offs / limitações:** numa wallet muito disputada a latência cresce com a fila, e cada requisição em espera ocupa uma conexão do pool. A espera tem limite (seção 9.3).
@@ -484,7 +525,7 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 | Não encontrado | Corrige o identificador | 404 (recurso da URL) / 422 (citado no corpo) | Não | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND` |
 | Rejeição de negócio | Desiste ou corrige | 422 | Sim (`REJECTED`) | `INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, `CURRENCY_MISMATCH`, `PLAYER_WALLET_MISMATCH`, `REFERENCE_NOT_FOUND`, `REFERENCE_MISMATCH`, `INVALID_REFERENCE_KIND`, `REFERENCE_NOT_PROCESSED`, `ALREADY_REVERSED`, `AMOUNT_MISMATCH` |
 | Falha transitória | Reenvia (com backoff) | 503 | Não | `TEMPORARILY_UNAVAILABLE` |
-| Falha permanente | Investiga; reenviar com a mesma key devolve o mesmo resultado | 500 | Sim (`FAILED`) | `PROCESSING_FAILED` |
+| Erro inesperado | Investiga; reenviar com a mesma key processa de novo | 500 | Não | `PROCESSING_FAILED` |
 
 | Código | Significado |
 |---|---|
@@ -502,14 +543,14 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 | `REVERSAL_INSUFFICIENT_FUNDS` | Reversão que deixaria o saldo negativo (distinto de `INSUFFICIENT_FUNDS`, como exige a regra 9) |
 | `CURRENCY_MISMATCH` | Moeda da operação diferente da moeda da wallet |
 | `PLAYER_WALLET_MISMATCH` | A wallet existe, mas não pertence ao `playerId` informado |
-| `REFERENCE_NOT_FOUND` | Referência não encontrada após esgotar as tentativas de `PENDING_REFERENCE` |
+| `REFERENCE_NOT_FOUND` | Referência não encontrada dentro do prazo de `PENDING_REFERENCE` (seção 14) |
 | `REFERENCE_MISMATCH` | Referência de outro provider, player, wallet, moeda ou rodada (o campo divergente vai para o log) |
 | `INVALID_REFERENCE_KIND` | Tipo de referência não permitido (`REFUND` só referencia `BET`; `ROLLBACK` só referencia `BET`, `WIN` ou `REFUND`) |
 | `REFERENCE_NOT_PROCESSED` | A referência existe, mas não está `PROCESSED` |
 | `ALREADY_REVERSED` | A referência já foi revertida (por `REFUND` ou `ROLLBACK`) |
 | `AMOUNT_MISMATCH` | Valor da reversão diferente do valor da referência |
 | `TEMPORARILY_UNAVAILABLE` | Banco ou fila indisponível, ou timeout de lock |
-| `PROCESSING_FAILED` | Erro permanente de infraestrutura; transação gravada como `FAILED` |
+| `PROCESSING_FAILED` | Erro inesperado no processamento; nada é gravado (seção 6.1) |
 
 ### 11.3 Consultas
 
@@ -637,7 +678,7 @@ A idempotência é verificada **depois** do lock, para que duas requisições co
 **Decisões sobre quando emitir:**
 - **`OPENING` emite `WagerTransactionProcessed` e `WalletBalanceChanged`:** ela é uma transação aplicada e altera o saldo; quem acompanha saldos precisa conhecer o saldo inicial.
 - **`PENDING_REFERENCE` emite só na entrada:** o fato de negócio ("aguardando referência") acontece uma vez. As novas tentativas são detalhe operacional e aparecem nas métricas; o desfecho chega por `Processed` ou `Rejected`.
-- **`FAILED` não emite evento:** não está entre os eventos mínimos do case e é uma falha operacional, não um fato de negócio. Fica registrada em logs, métricas e DLQ. Um evento novo pode ser adicionado no futuro sem quebrar os contratos existentes.
+- **`FAILED` não emite evento:** não está entre os eventos mínimos do case e é uma falha operacional, não um fato de negócio. Fica registrada em logs e na DLQ. Um evento novo pode ser adicionado no futuro sem quebrar os contratos existentes.
 
 **Validações na construção dos eventos (erros de programação, `InvariantViolationError`):**
 - cada evento de transação exige o status correspondente (`PROCESSED`, `REJECTED` ou `PENDING_REFERENCE`);
@@ -851,7 +892,14 @@ Vale para o publisher do outbox e para o worker de `PENDING_REFERENCE` (seção 
 
 ## 17. Testes
 
-<!-- Estratégia geral, cenários de mensageria e multi-instância (etapas 6 a 8). -->
+Os testes de unidade ficam ao lado do código (`src/**/*.test.ts`) e cobrem o domínio e as regras da application sem infraestrutura. Os demais ficam em `test/` e usam PostgreSQL e LocalStack reais, nunca mocks de banco ou fila:
+- **repositórios e schema** (`test/persistence/`): constraints com o nome conferido, migrations reversíveis num banco temporário;
+- **use cases** (`test/application/`): regras, atomicidade e concorrência com paralelismo real;
+- **HTTP e2e** (`test/http/`): o `AppModule` sobe e recebe requisições;
+- **mensageria e workers** (`test/messaging/`, `test/workers/`): filas e bancos temporários;
+- **resiliência** (`test/resilience/`): instâncias em processos separados, mortas com `SIGKILL`.
+
+Todo teste que altera saldo termina verificando `wallet.balance == saldo reconstruído pelo ledger`. Nenhum teste usa `sleep` fixo: a espera é por condição, com timeout. As seções abaixo detalham os cenários de cada grupo.
 
 ### 17.1 Concorrência do núcleo
 
@@ -1009,4 +1057,17 @@ Os testes que já existiam em processo único foram mantidos: eles já provam o 
 
 ## 19. Uso de IA
 
-<!-- Para que foi usada e como o conteúdo foi validado. -->
+Usei IA (Claude, pelo Claude Code) durante todo o case: no planejamento, na discussão das decisões, na escrita do código e dos testes, e na redação desta documentação. O que cabe a mim é cada decisão registrada aqui e a validação de tudo o que foi entregue.
+
+**Para que foi usada:**
+- **Planejamento:** dividir o case em etapas, com as decisões que cada uma exigia e os temas que eu precisava estudar antes.
+- **Decisões:** em cada etapa, a IA levantava as perguntas em aberto em rodadas, com alternativas, trade-offs e uma recomendação. A decisão era minha. Recusei ou mudei recomendações quando não concordava, e pedi cortes quando a proposta ia além do que o case pedia (por exemplo, nas métricas, seção 16.3). Cada decisão foi registrada neste documento no momento em que foi tomada, e não reconstruída no fim.
+- **Código e testes:** a IA escreveu boa parte do código e dos testes a partir das decisões tomadas. O núcleo financeiro (`Money`, a transação do use case, o lock, a idempotência e as constraints) foi revisado linha a linha.
+- **Revisão e documentação:** revisão das mudanças antes de cada commit e redação deste documento e do README a partir das decisões.
+
+**Como o resultado foi validado:**
+- **Testes contra a infraestrutura real.** PostgreSQL e LocalStack em containers, com paralelismo real nos cenários de concorrência e processos separados, mortos com `SIGKILL`, nos de falha (seção 17). Todo teste que mexe em saldo confere a invariante saldo = ledger.
+- **Mutações manuais.** Os testes de falha foram conferidos quebrando o código de propósito: ack antes de processar, sem `SKIP LOCKED`/`FOR UPDATE`, sem a checagem de inbox e idempotência. Os testes passaram a falhar, o que mostra que pegam o defeito (seção 17.5).
+- **Garantias no banco, não só no código.** Unicidade, imutabilidade e não negatividade são constraints e triggers testadas com SQL direto (seção 8). Um erro no código gerado esbarra no schema.
+- **Teste de arquitetura.** `test/architecture.test.ts` impede que o domínio e a application importem framework, ORM ou infraestrutura.
+- **Commits pequenos, por etapa,** cada um revisado antes de subir e entregue por PR.
